@@ -13,7 +13,7 @@ PyHamcrest
 bs4
 awscli==1.16.35
 flask
--U https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-0.9.0.dev0-cp36-cp36m-manylinux1_x86_64.whl
+https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-0.9.0.dev0-cp36-cp36m-manylinux1_x86_64.whl
 ray[tune]
 
 # PyTorch Theme
@@ -26,5 +26,5 @@ pandas
 scikit-image
 # pillow >= 4.2 will throw error when trying to write mode RGBA as JPEG,
 # this is a workaround to the issue.
-#pillow==4.1.1
+pillow==4.1.1
 wget
