@@ -5,6 +5,7 @@
 
 Computation times
 =================
-**00:00.052** total execution time for **beginner** files:
+**40:58.174** total execution time for **beginner** files:
 
-- **00:00.052**: :ref:`sphx_glr_beginner_example_tutorial.py` (``example_tutorial.py``)
+- **40:58.135**: :ref:`sphx_glr_beginner_hyperparameter_tuning_tutorial.py` (``hyperparameter_tuning_tutorial.py``)
+- **00:00.039**: :ref:`sphx_glr_beginner_example_tutorial.py` (``example_tutorial.py``)

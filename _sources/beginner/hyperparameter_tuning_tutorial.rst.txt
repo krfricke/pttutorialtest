@@ -1,0 +1,2942 @@
+.. note::
+    :class: sphx-glr-download-link-note
+
+    Click :ref:`here <sphx_glr_download_beginner_hyperparameter_tuning_tutorial.py>` to download the full example code
+.. rst-class:: sphx-glr-example-title
+
+.. _sphx_glr_beginner_hyperparameter_tuning_tutorial.py:
+
+
+Hyperparameter tuning with Ray Tune
+===================================
+
+Hyperparameter tuning can make the difference between an average model and a highly
+accurate one. Often simple things like choosing a different learning rate or changing
+a network layer size can have a dramatic impact on your model performance.
+
+Fortunately, there are tools that help with finding the best combination of parameters.
+`Ray Tune <https://docs.ray.io/en/latest/tune.html>`_ is an industry standard tool for
+distributed hyperparameter tuning. Ray Tune includes the latest hyperparameter search
+algorithms, integrates with TensorBoard and other analysis libraries, and natively
+supports distributed training through `Ray's distributed machine learning engine
+<https://ray.io/>`_.
+
+In this tutorial, we will show you how to integrate Tune into your PyTorch
+training workflow. We will extend `this tutorial from the PyTorch documentation
+<https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html>`_ for training
+a CIFAR10 image classifier.
+
+As you will see, we only need to add some slight modifications. In particular, we
+need to
+
+1. wrap data loading and training in functions,
+2. make some network parameters configurable,
+3. add checkpointing (optional),
+4. and define the search space for the model tuning
+
+|
+
+To run this tutorial, please make sure the following packages are
+installed:
+
+-  ``ray[tune]``: Distributed hyperparameter tuning library
+-  ``torchvision``: For the data transformers
+
+Setup / Imports
+---------------
+Let's start with the imports:
+
+
+.. code-block:: default
+
+    from functools import partial
+    import numpy as np
+    import os
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import torch.optim as optim
+    from torch.utils.data import random_split
+    import torchvision
+    import torchvision.transforms as transforms
+    from ray import tune
+    from ray.tune import CLIReporter
+    from ray.tune.schedulers import ASHAScheduler
+
+
+
+
+
+
+
+Most of the imports are needed for building the PyTorch model. Only the last three
+imports are for Ray Tune.
+
+Data loaders
+------------
+We wrap the data loaders in their own function and pass a global data directory.
+This way we can share a data directory between different trials.
+
+
+.. code-block:: default
+
+
+    def load_data(data_dir="./data"):
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+
+        trainset = torchvision.datasets.CIFAR10(
+            root=data_dir, train=True, download=True, transform=transform)
+
+        testset = torchvision.datasets.CIFAR10(
+            root=data_dir, train=False, download=True, transform=transform)
+
+        return trainset, testset
+
+
+
+
+
+
+
+Configurable neural network
+---------------------------
+We can only tune those parameters that are configurable. In this example, we can specify
+the layer sizes of the fully connected layers:
+
+
+.. code-block:: default
+
+
+    class Net(nn.Module):
+        def __init__(self, l1=120, l2=84):
+            super(Net, self).__init__()
+            self.conv1 = nn.Conv2d(3, 6, 5)
+            self.pool = nn.MaxPool2d(2, 2)
+            self.conv2 = nn.Conv2d(6, 16, 5)
+            self.fc1 = nn.Linear(16 * 5 * 5, l1)
+            self.fc2 = nn.Linear(l1, l2)
+            self.fc3 = nn.Linear(l2, 10)
+
+        def forward(self, x):
+            x = self.pool(F.relu(self.conv1(x)))
+            x = self.pool(F.relu(self.conv2(x)))
+            x = x.view(-1, 16 * 5 * 5)
+            x = F.relu(self.fc1(x))
+            x = F.relu(self.fc2(x))
+            x = self.fc3(x)
+            return x
+
+
+
+
+
+
+
+The train function
+------------------
+Now it gets interesting, because we introduce some changes to the example `from the PyTorch
+documentation <https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html>`_.
+
+We wrap the training script in a function ``train_cifar(config, checkpoint=None, data_dir=None)``.
+As you can guess, the ``config`` parameter will receive the hyperparameters we would like to
+train with. The ``checkpoint`` parameter is used to restore checkpoints. The ``data_dir`` specifies
+the directory where we load and store the data, so multiple runs can share the same data source.
+
+.. code-block:: python
+
+    net = Net(config["l1"], config["l2"])
+
+    if checkpoint:
+        net.load_state_dict(torch.load(checkpoint))
+
+The learning rate of the optimizer is made configurable, too:
+
+.. code-block:: python
+
+    optimizer = optim.SGD(net.parameters(), lr=config["lr"], momentum=0.9)
+
+We also split the training data into a training and validation subset. We thus train on
+80% of the data and calculate the validation loss on the remaining 20%. The batch sizes
+with which we iterate through the training and test sets are configurable as well.
+
+Adding (multi) GPU support with DataParallel
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Image classification benefits largely from GPUs. Luckily, we can continue to use
+PyTorch's abstractions in Ray Tune. Thus, we can wrap our model in ``nn.DataParallel``
+to support data parallel training on multiple GPUs:
+
+.. code-block:: python
+
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda:0"
+        if torch.cuda.device_count() > 1:
+            net = nn.DataParallel(net)
+    net.to(device)
+
+By using a ``device`` variable we make sure that training also works when we have
+no GPUs available. PyTorch requires us to send our data to the GPU memory explicitly,
+like this:
+
+.. code-block:: python
+
+    for i, data in enumerate(trainloader, 0):
+        inputs, labels = data
+        inputs, labels = inputs.to(device), labels.to(device)
+
+The code now supports training on CPUs, on a single GPU, and on multiple GPUs. Notably, Ray
+also supports `fractional GPUs <https://docs.ray.io/en/master/using-ray-with-gpus.html#fractional-gpus>`_
+so we can share GPUs among trials, as long as the model still fits on the GPU memory. We'll come back
+to that later.
+
+Communicating with Ray Tune
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The most interesting part is the communication with Tune:
+
+.. code-block:: python
+
+    checkpoint_dir = tune.make_checkpoint_dir(epoch)
+    path = os.path.join(checkpoint_dir, "checkpoint")
+    torch.save((net.state_dict(), optimizer.state_dict()), path)
+    tune.save_checkpoint(path)
+
+    tune.report(loss=(val_loss / val_steps), accuracy=correct / total)
+
+Here we first save a checkpoint and then report some metrics back to Tune. Specifically,
+we send the validation loss and accuracy back to Tune. Tune can then use these metrics
+to decide which hyperparameter configuration lead to the best results. These metrics
+can also be used to stop bad performing trials early in order to avoid wasting
+resources on those trials.
+
+The checkpoint saving is optional, however, it is necessary if we wanted to use advanced
+schedulers like `Population Based Training <https://docs.ray.io/en/master/tune/tutorials/tune-advanced-tutorial.html>`_.
+Also, by saving the checkpoint we can later load the trained models and validate them
+on a test set.
+
+Full training function
+~~~~~~~~~~~~~~~~~~~~~~
+
+The full code example looks like this:
+
+
+.. code-block:: default
+
+
+    def train_cifar(config, checkpoint=None, data_dir=None):
+        net = Net(config["l1"], config["l2"])
+
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda:0"
+            if torch.cuda.device_count() > 1:
+                net = nn.DataParallel(net)
+        net.to(device)
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.SGD(net.parameters(), lr=config["lr"], momentum=0.9)
+
+        if checkpoint:
+            print("loading checkpoint {}".format(checkpoint))
+            model_state, optimizer_state = torch.load(checkpoint)
+            net.load_state_dict(model_state)
+            optimizer.load_state_dict(optimizer_state)
+
+        trainset, testset = load_data(data_dir)
+
+        test_abs = int(len(trainset) * 0.8)
+        train_subset, val_subset = random_split(
+            trainset, [test_abs, len(trainset) - test_abs])
+
+        trainloader = torch.utils.data.DataLoader(
+            train_subset,
+            batch_size=int(config["batch_size"]),
+            shuffle=True,
+            num_workers=8)
+        valloader = torch.utils.data.DataLoader(
+            val_subset,
+            batch_size=int(config["batch_size"]),
+            shuffle=True,
+            num_workers=8)
+
+        for epoch in range(10):  # loop over the dataset multiple times
+            running_loss = 0.0
+            epoch_steps = 0
+            for i, data in enumerate(trainloader, 0):
+                # get the inputs; data is a list of [inputs, labels]
+                inputs, labels = data
+                inputs, labels = inputs.to(device), labels.to(device)
+
+                # zero the parameter gradients
+                optimizer.zero_grad()
+
+                # forward + backward + optimize
+                outputs = net(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+
+                # print statistics
+                running_loss += loss.item()
+                epoch_steps += 1
+                if i % 2000 == 1999:  # print every 2000 mini-batches
+                    print("[%d, %5d] loss: %.3f" % (epoch + 1, i + 1,
+                                                    running_loss / epoch_steps))
+                    running_loss = 0.0
+
+            # Validation loss
+            val_loss = 0.0
+            val_steps = 0
+            total = 0
+            correct = 0
+            for i, data in enumerate(valloader, 0):
+                with torch.no_grad():
+                    inputs, labels = data
+                    inputs, labels = inputs.to(device), labels.to(device)
+
+                    outputs = net(inputs)
+                    _, predicted = torch.max(outputs.data, 1)
+                    total += labels.size(0)
+                    correct += (predicted == labels).sum().item()
+
+                    loss = criterion(outputs, labels)
+                    val_loss += loss.cpu().numpy()
+                    val_steps += 1
+
+            checkpoint_dir = tune.make_checkpoint_dir(epoch)
+            path = os.path.join(checkpoint_dir, "checkpoint")
+            torch.save((net.state_dict(), optimizer.state_dict()), path)
+            tune.save_checkpoint(path)
+
+            tune.report(loss=(val_loss / val_steps), accuracy=correct / total)
+        print("Finished Training")
+
+
+
+
+
+
+
+As you can see, most of the code is adapted directly from the original example.
+
+Test set accuracy
+-----------------
+Commonly the performance of a machine learning model is tested on a hold-out test
+set with data that has not been used for training the model. We also wrap this in a
+function:
+
+
+.. code-block:: default
+
+
+    def test_accuracy(net, device="cpu"):
+        trainset, testset = load_data()
+
+        testloader = torch.utils.data.DataLoader(
+            testset, batch_size=4, shuffle=False, num_workers=2)
+
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for data in testloader:
+                images, labels = data
+                images, labels = images.to(device), labels.to(device)
+                outputs = net(images)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        return correct / total
+
+
+
+
+
+
+
+The function also expects a ``device`` parameter, so we can do the
+test set validation on a GPU.
+
+Configuring the search space
+----------------------------
+Lastly, we need to define Tune's search space. Here is an example:
+
+.. code-block:: python
+
+    config = {
+        "l1": tune.sample_from(lambda _: 2**np.random.randint(2, 9)),
+        "l2": tune.sample_from(lambda _: 2**np.random.randint(2, 9)),
+        "lr": tune.loguniform(1e-4, 1e-1),
+        "batch_size": tune.choice([2, 4, 8, 16])
+    }
+
+The ``tune.sample_from()`` function makes it possible to define your own sample
+methods to obtain hyperparameters. In this example, the ``l1`` and ``l2`` parameters
+should be powers of 2 between 4 and 256, so either 4, 8, 16, 32, 64, 128, or 256.
+The ``lr`` (learning rate) should be uniformly sampled between 0.0001 and 0.1. Lastly,
+the batch size is a choice between 2, 4, 8, and 16.
+
+At each trial, Tune will now randomly sample a combination of parameters from these
+search spaces. It will then train a number of models in parallel and find the best
+performing one among these. We also use the ``ASHAScheduler`` which will terminate bad
+performing trials early.
+
+We wrap the ``train_cifar`` function with ``functools.partial`` to set the constant
+``data_dir`` parameter. We can also tell Ray Tune what resources should be
+available for each trial:
+
+.. code-block:: python
+
+    gpus_per_trial = 2
+    # ...
+    result = tune.run(
+        partial(train_cifar, data_dir=data_dir),
+        resources_per_trial={"cpu": 8, "gpu": gpus_per_trial},
+        config=config,
+        num_samples=num_samples,
+        scheduler=scheduler,
+        progress_reporter=reporter,
+        checkpoint_at_end=True)
+
+You can specify the number of CPUs, which are then available e.g.
+to increase the ``num_workers`` of the PyTorch ``DataLoader`` instances. The selected
+number of GPUs are made visible to PyTorch in each trial. Trials do not have access to
+GPUs that haven't been requested for them - so you don't have to care about two trials
+using the same set of resources.
+
+Here we can also specify fractional GPUs, so something like ``gpus_per_trial=0.5`` is
+completely valid. The trials will then share GPUs among each other.
+You just have to make sure that the models still fit in the GPU memory.
+
+After training the models, we will find the best performing one and load the trained
+network from the checkpoint file. We then obtain the test set accuracy and report
+everything by printing.
+
+The full main function looks like this:
+
+
+.. code-block:: default
+
+
+    def main(num_samples=10, max_num_epochs=10, gpus_per_trial=2):
+        data_dir = os.path.abspath("./data")
+        load_data(data_dir)
+        config = {
+            "l1": tune.sample_from(lambda _: 2 ** np.random.randint(2, 9)),
+            "l2": tune.sample_from(lambda _: 2 ** np.random.randint(2, 9)),
+            "lr": tune.loguniform(1e-4, 1e-1),
+            "batch_size": tune.choice([2, 4, 8, 16])
+        }
+        scheduler = ASHAScheduler(
+            metric="loss",
+            mode="min",
+            max_t=max_num_epochs,
+            grace_period=1,
+            reduction_factor=2)
+        reporter = CLIReporter(
+            # parameter_columns=["l1", "l2", "lr", "batch_size"],
+            metric_columns=["loss", "accuracy", "training_iteration"])
+        result = tune.run(
+            partial(train_cifar, data_dir=data_dir),
+            resources_per_trial={"cpu": 2, "gpu": gpus_per_trial},
+            config=config,
+            num_samples=num_samples,
+            scheduler=scheduler,
+            progress_reporter=reporter,
+            checkpoint_at_end=True)
+
+        best_trial = result.get_best_trial("loss", "min", "last")
+        print("Best trial config: {}".format(best_trial.config))
+        print("Best trial final validation loss: {}".format(
+            best_trial.last_result["loss"]))
+        print("Best trial final validation accuracy: {}".format(
+            best_trial.last_result["accuracy"]))
+
+        best_trained_model = Net(best_trial.config["l1"], best_trial.config["l2"])
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda:0"
+            if gpus_per_trial > 1:
+                best_trained_model = nn.DataParallel(best_trained_model)
+        best_trained_model.to(device)
+
+        model_state, optimizer_state = torch.load(best_trial.checkpoint.value)
+        best_trained_model.load_state_dict(model_state)
+
+        test_acc = test_accuracy(best_trained_model, device)
+        print("Best trial test set accuracy: {}".format(test_acc))
+
+
+    if __name__ == "__main__":
+        # You can change the number of GPUs per trial here:
+        main(num_samples=10, max_num_epochs=10, gpus_per_trial=0)
+
+
+
+
+
+
+.. rst-class:: sphx-glr-script-out
+
+ Out:
+
+ .. code-block:: none
+
+    Downloading https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz to /home/runner/work/pttutorialtest/pttutorialtest/beginner_source/data/cifar-10-python.tar.gz
+    Failed download. Trying https -> http instead. Downloading http://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz to /home/runner/work/pttutorialtest/pttutorialtest/beginner_source/data/cifar-10-python.tar.gz
+    Extracting /home/runner/work/pttutorialtest/pttutorialtest/beginner_source/data/cifar-10-python.tar.gz to /home/runner/work/pttutorialtest/pttutorialtest/beginner_source/data
+    Files already downloaded and verified
+    == Status ==
+    Memory usage on this node: 1.3/6.8 GiB
+    Using AsyncHyperBand: num_stopped=0
+    Bracket: Iter 8.000: None | Iter 4.000: None | Iter 2.000: None | Iter 1.000: None
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (9 PENDING, 1 RUNNING)
+    +---------------------+----------+-------+--------------+------+------+-------------+
+    | Trial name          | status   | loc   |   batch_size |   l1 |   l2 |          lr |
+    |---------------------+----------+-------+--------------+------+------+-------------|
+    | DEFAULT_d01f4_00000 | RUNNING  |       |            8 |    4 |   64 | 0.0122495   |
+    | DEFAULT_d01f4_00001 | PENDING  |       |            4 |  128 |   64 | 0.000244637 |
+    | DEFAULT_d01f4_00002 | PENDING  |       |           16 |  256 |    8 | 0.0880943   |
+    | DEFAULT_d01f4_00003 | PENDING  |       |            2 |  128 |  256 | 0.0291105   |
+    | DEFAULT_d01f4_00004 | PENDING  |       |            8 |   64 |   16 | 0.0602952   |
+    | DEFAULT_d01f4_00005 | PENDING  |       |            8 |    4 |   64 | 0.000120017 |
+    | DEFAULT_d01f4_00006 | PENDING  |       |            2 |  256 |  256 | 0.00145522  |
+    | DEFAULT_d01f4_00007 | PENDING  |       |            8 |    4 |   32 | 0.058841    |
+    | DEFAULT_d01f4_00008 | PENDING  |       |            4 |  128 |  256 | 0.000421871 |
+    | DEFAULT_d01f4_00009 | PENDING  |       |            4 |   16 |   32 | 0.00538551  |
+    +---------------------+----------+-------+--------------+------+------+-------------+
+
+
+    [2m[36m(pid=5841)[0m Files already downloaded and verified
+    [2m[36m(pid=5841)[0m Files already downloaded and verified
+    [2m[36m(pid=5841)[0m [1,  2000] loss: 2.150
+    [2m[36m(pid=5841)[0m [1,  4000] loss: 1.057
+    Result for DEFAULT_d01f4_00000:
+      accuracy: 0.0986
+      date: 2020-07-15_09-23-44
+      done: false
+      experiment_id: b926073c1f304b428ca45e429ed4a450
+      experiment_tag: 0_batch_size=8,l1=4,l2=64,lr=0.012249
+      hostname: fv-az18
+      iterations_since_restore: 1
+      loss: 2.30502581577301
+      node_ip: 10.1.0.4
+      pid: 5841
+      should_checkpoint: true
+      time_since_restore: 28.253643035888672
+      time_this_iter_s: 28.253643035888672
+      time_total_s: 28.253643035888672
+      timestamp: 1594805024
+      timesteps_since_restore: 0
+      training_iteration: 1
+      trial_id: d01f4_00000
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=0
+    Bracket: Iter 8.000: None | Iter 4.000: None | Iter 2.000: None | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (9 PENDING, 1 RUNNING)
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status   | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | RUNNING  | 10.1.0.4:5841 |            8 |    4 |   64 | 0.0122495   | 2.30503 |     0.0986 |                    1 |
+    | DEFAULT_d01f4_00001 | PENDING  |               |            4 |  128 |   64 | 0.000244637 |         |            |                      |
+    | DEFAULT_d01f4_00002 | PENDING  |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING  |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING  |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING  |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING  |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING  |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING  |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING  |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5841)[0m [2,  2000] loss: 2.306
+    [2m[36m(pid=5841)[0m [2,  4000] loss: 1.153
+    Result for DEFAULT_d01f4_00000:
+      accuracy: 0.098
+      date: 2020-07-15_09-24-11
+      done: false
+      experiment_id: b926073c1f304b428ca45e429ed4a450
+      experiment_tag: 0_batch_size=8,l1=4,l2=64,lr=0.012249
+      hostname: fv-az18
+      iterations_since_restore: 2
+      loss: 2.3075860612869263
+      node_ip: 10.1.0.4
+      pid: 5841
+      should_checkpoint: true
+      time_since_restore: 54.82285165786743
+      time_this_iter_s: 26.56920862197876
+      time_total_s: 54.82285165786743
+      timestamp: 1594805051
+      timesteps_since_restore: 0
+      training_iteration: 2
+      trial_id: d01f4_00000
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=0
+    Bracket: Iter 8.000: None | Iter 4.000: None | Iter 2.000: -2.3075860612869263 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (9 PENDING, 1 RUNNING)
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status   | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | RUNNING  | 10.1.0.4:5841 |            8 |    4 |   64 | 0.0122495   | 2.30759 |      0.098 |                    2 |
+    | DEFAULT_d01f4_00001 | PENDING  |               |            4 |  128 |   64 | 0.000244637 |         |            |                      |
+    | DEFAULT_d01f4_00002 | PENDING  |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING  |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING  |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING  |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING  |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING  |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING  |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING  |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5841)[0m [3,  2000] loss: 2.306
+    [2m[36m(pid=5841)[0m [3,  4000] loss: 1.153
+    Result for DEFAULT_d01f4_00000:
+      accuracy: 0.099
+      date: 2020-07-15_09-24-37
+      done: false
+      experiment_id: b926073c1f304b428ca45e429ed4a450
+      experiment_tag: 0_batch_size=8,l1=4,l2=64,lr=0.012249
+      hostname: fv-az18
+      iterations_since_restore: 3
+      loss: 2.3058184270858764
+      node_ip: 10.1.0.4
+      pid: 5841
+      should_checkpoint: true
+      time_since_restore: 80.81378555297852
+      time_this_iter_s: 25.990933895111084
+      time_total_s: 80.81378555297852
+      timestamp: 1594805077
+      timesteps_since_restore: 0
+      training_iteration: 3
+      trial_id: d01f4_00000
+  
+    == Status ==
+    Memory usage on this node: 1.8/6.8 GiB
+    Using AsyncHyperBand: num_stopped=0
+    Bracket: Iter 8.000: None | Iter 4.000: None | Iter 2.000: -2.3075860612869263 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (9 PENDING, 1 RUNNING)
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status   | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | RUNNING  | 10.1.0.4:5841 |            8 |    4 |   64 | 0.0122495   | 2.30582 |      0.099 |                    3 |
+    | DEFAULT_d01f4_00001 | PENDING  |               |            4 |  128 |   64 | 0.000244637 |         |            |                      |
+    | DEFAULT_d01f4_00002 | PENDING  |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING  |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING  |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING  |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING  |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING  |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING  |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING  |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5841)[0m [4,  2000] loss: 2.306
+    [2m[36m(pid=5841)[0m [4,  4000] loss: 1.153
+    Result for DEFAULT_d01f4_00000:
+      accuracy: 0.0968
+      date: 2020-07-15_09-25-04
+      done: false
+      experiment_id: b926073c1f304b428ca45e429ed4a450
+      experiment_tag: 0_batch_size=8,l1=4,l2=64,lr=0.012249
+      hostname: fv-az18
+      iterations_since_restore: 4
+      loss: 2.304421781921387
+      node_ip: 10.1.0.4
+      pid: 5841
+      should_checkpoint: true
+      time_since_restore: 107.35271859169006
+      time_this_iter_s: 26.538933038711548
+      time_total_s: 107.35271859169006
+      timestamp: 1594805104
+      timesteps_since_restore: 0
+      training_iteration: 4
+      trial_id: d01f4_00000
+  
+    == Status ==
+    Memory usage on this node: 1.8/6.8 GiB
+    Using AsyncHyperBand: num_stopped=0
+    Bracket: Iter 8.000: None | Iter 4.000: -2.304421781921387 | Iter 2.000: -2.3075860612869263 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (9 PENDING, 1 RUNNING)
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status   | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | RUNNING  | 10.1.0.4:5841 |            8 |    4 |   64 | 0.0122495   | 2.30442 |     0.0968 |                    4 |
+    | DEFAULT_d01f4_00001 | PENDING  |               |            4 |  128 |   64 | 0.000244637 |         |            |                      |
+    | DEFAULT_d01f4_00002 | PENDING  |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING  |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING  |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING  |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING  |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING  |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING  |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING  |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5841)[0m [5,  2000] loss: 2.306
+    [2m[36m(pid=5841)[0m [5,  4000] loss: 1.153
+    Result for DEFAULT_d01f4_00000:
+      accuracy: 0.1013
+      date: 2020-07-15_09-25-30
+      done: false
+      experiment_id: b926073c1f304b428ca45e429ed4a450
+      experiment_tag: 0_batch_size=8,l1=4,l2=64,lr=0.012249
+      hostname: fv-az18
+      iterations_since_restore: 5
+      loss: 2.3044018898010252
+      node_ip: 10.1.0.4
+      pid: 5841
+      should_checkpoint: true
+      time_since_restore: 134.23562049865723
+      time_this_iter_s: 26.882901906967163
+      time_total_s: 134.23562049865723
+      timestamp: 1594805130
+      timesteps_since_restore: 0
+      training_iteration: 5
+      trial_id: d01f4_00000
+  
+    == Status ==
+    Memory usage on this node: 1.8/6.8 GiB
+    Using AsyncHyperBand: num_stopped=0
+    Bracket: Iter 8.000: None | Iter 4.000: -2.304421781921387 | Iter 2.000: -2.3075860612869263 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (9 PENDING, 1 RUNNING)
+    +---------------------+----------+---------------+--------------+------+------+-------------+--------+------------+----------------------+
+    | Trial name          | status   | loc           |   batch_size |   l1 |   l2 |          lr |   loss |   accuracy |   training_iteration |
+    |---------------------+----------+---------------+--------------+------+------+-------------+--------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | RUNNING  | 10.1.0.4:5841 |            8 |    4 |   64 | 0.0122495   | 2.3044 |     0.1013 |                    5 |
+    | DEFAULT_d01f4_00001 | PENDING  |               |            4 |  128 |   64 | 0.000244637 |        |            |                      |
+    | DEFAULT_d01f4_00002 | PENDING  |               |           16 |  256 |    8 | 0.0880943   |        |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING  |               |            2 |  128 |  256 | 0.0291105   |        |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING  |               |            8 |   64 |   16 | 0.0602952   |        |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING  |               |            8 |    4 |   64 | 0.000120017 |        |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING  |               |            2 |  256 |  256 | 0.00145522  |        |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING  |               |            8 |    4 |   32 | 0.058841    |        |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING  |               |            4 |  128 |  256 | 0.000421871 |        |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING  |               |            4 |   16 |   32 | 0.00538551  |        |            |                      |
+    +---------------------+----------+---------------+--------------+------+------+-------------+--------+------------+----------------------+
+
+
+    [2m[36m(pid=5841)[0m [6,  2000] loss: 2.306
+    [2m[36m(pid=5841)[0m [6,  4000] loss: 1.153
+    Result for DEFAULT_d01f4_00000:
+      accuracy: 0.1057
+      date: 2020-07-15_09-25-59
+      done: false
+      experiment_id: b926073c1f304b428ca45e429ed4a450
+      experiment_tag: 0_batch_size=8,l1=4,l2=64,lr=0.012249
+      hostname: fv-az18
+      iterations_since_restore: 6
+      loss: 2.30330916557312
+      node_ip: 10.1.0.4
+      pid: 5841
+      should_checkpoint: true
+      time_since_restore: 162.74319076538086
+      time_this_iter_s: 28.507570266723633
+      time_total_s: 162.74319076538086
+      timestamp: 1594805159
+      timesteps_since_restore: 0
+      training_iteration: 6
+      trial_id: d01f4_00000
+  
+    == Status ==
+    Memory usage on this node: 1.8/6.8 GiB
+    Using AsyncHyperBand: num_stopped=0
+    Bracket: Iter 8.000: None | Iter 4.000: -2.304421781921387 | Iter 2.000: -2.3075860612869263 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (9 PENDING, 1 RUNNING)
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status   | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | RUNNING  | 10.1.0.4:5841 |            8 |    4 |   64 | 0.0122495   | 2.30331 |     0.1057 |                    6 |
+    | DEFAULT_d01f4_00001 | PENDING  |               |            4 |  128 |   64 | 0.000244637 |         |            |                      |
+    | DEFAULT_d01f4_00002 | PENDING  |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING  |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING  |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING  |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING  |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING  |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING  |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING  |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5841)[0m [7,  2000] loss: 2.306
+    [2m[36m(pid=5841)[0m [7,  4000] loss: 1.153
+    Result for DEFAULT_d01f4_00000:
+      accuracy: 0.0982
+      date: 2020-07-15_09-26-27
+      done: false
+      experiment_id: b926073c1f304b428ca45e429ed4a450
+      experiment_tag: 0_batch_size=8,l1=4,l2=64,lr=0.012249
+      hostname: fv-az18
+      iterations_since_restore: 7
+      loss: 2.3080370613098147
+      node_ip: 10.1.0.4
+      pid: 5841
+      should_checkpoint: true
+      time_since_restore: 190.70933437347412
+      time_this_iter_s: 27.96614360809326
+      time_total_s: 190.70933437347412
+      timestamp: 1594805187
+      timesteps_since_restore: 0
+      training_iteration: 7
+      trial_id: d01f4_00000
+  
+    == Status ==
+    Memory usage on this node: 1.8/6.8 GiB
+    Using AsyncHyperBand: num_stopped=0
+    Bracket: Iter 8.000: None | Iter 4.000: -2.304421781921387 | Iter 2.000: -2.3075860612869263 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (9 PENDING, 1 RUNNING)
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status   | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | RUNNING  | 10.1.0.4:5841 |            8 |    4 |   64 | 0.0122495   | 2.30804 |     0.0982 |                    7 |
+    | DEFAULT_d01f4_00001 | PENDING  |               |            4 |  128 |   64 | 0.000244637 |         |            |                      |
+    | DEFAULT_d01f4_00002 | PENDING  |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING  |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING  |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING  |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING  |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING  |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING  |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING  |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5841)[0m [8,  2000] loss: 2.306
+    [2m[36m(pid=5841)[0m [8,  4000] loss: 1.153
+    Result for DEFAULT_d01f4_00000:
+      accuracy: 0.1013
+      date: 2020-07-15_09-26-55
+      done: false
+      experiment_id: b926073c1f304b428ca45e429ed4a450
+      experiment_tag: 0_batch_size=8,l1=4,l2=64,lr=0.012249
+      hostname: fv-az18
+      iterations_since_restore: 8
+      loss: 2.305310874938965
+      node_ip: 10.1.0.4
+      pid: 5841
+      should_checkpoint: true
+      time_since_restore: 218.50371265411377
+      time_this_iter_s: 27.79437828063965
+      time_total_s: 218.50371265411377
+      timestamp: 1594805215
+      timesteps_since_restore: 0
+      training_iteration: 8
+      trial_id: d01f4_00000
+  
+    == Status ==
+    Memory usage on this node: 1.8/6.8 GiB
+    Using AsyncHyperBand: num_stopped=0
+    Bracket: Iter 8.000: -2.305310874938965 | Iter 4.000: -2.304421781921387 | Iter 2.000: -2.3075860612869263 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (9 PENDING, 1 RUNNING)
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status   | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | RUNNING  | 10.1.0.4:5841 |            8 |    4 |   64 | 0.0122495   | 2.30531 |     0.1013 |                    8 |
+    | DEFAULT_d01f4_00001 | PENDING  |               |            4 |  128 |   64 | 0.000244637 |         |            |                      |
+    | DEFAULT_d01f4_00002 | PENDING  |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING  |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING  |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING  |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING  |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING  |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING  |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING  |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5841)[0m [9,  2000] loss: 2.306
+    [2m[36m(pid=5841)[0m [9,  4000] loss: 1.153
+    Result for DEFAULT_d01f4_00000:
+      accuracy: 0.0988
+      date: 2020-07-15_09-27-23
+      done: false
+      experiment_id: b926073c1f304b428ca45e429ed4a450
+      experiment_tag: 0_batch_size=8,l1=4,l2=64,lr=0.012249
+      hostname: fv-az18
+      iterations_since_restore: 9
+      loss: 2.3078442754745483
+      node_ip: 10.1.0.4
+      pid: 5841
+      should_checkpoint: true
+      time_since_restore: 246.31180715560913
+      time_this_iter_s: 27.80809450149536
+      time_total_s: 246.31180715560913
+      timestamp: 1594805243
+      timesteps_since_restore: 0
+      training_iteration: 9
+      trial_id: d01f4_00000
+  
+    == Status ==
+    Memory usage on this node: 1.8/6.8 GiB
+    Using AsyncHyperBand: num_stopped=0
+    Bracket: Iter 8.000: -2.305310874938965 | Iter 4.000: -2.304421781921387 | Iter 2.000: -2.3075860612869263 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (9 PENDING, 1 RUNNING)
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status   | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | RUNNING  | 10.1.0.4:5841 |            8 |    4 |   64 | 0.0122495   | 2.30784 |     0.0988 |                    9 |
+    | DEFAULT_d01f4_00001 | PENDING  |               |            4 |  128 |   64 | 0.000244637 |         |            |                      |
+    | DEFAULT_d01f4_00002 | PENDING  |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING  |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING  |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING  |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING  |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING  |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING  |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING  |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5841)[0m [10,  2000] loss: 2.306
+    [2m[36m(pid=5841)[0m [10,  4000] loss: 1.153
+    Result for DEFAULT_d01f4_00000:
+      accuracy: 0.0988
+      date: 2020-07-15_09-27-49
+      done: true
+      experiment_id: b926073c1f304b428ca45e429ed4a450
+      experiment_tag: 0_batch_size=8,l1=4,l2=64,lr=0.012249
+      hostname: fv-az18
+      iterations_since_restore: 10
+      loss: 2.3065140533447264
+      node_ip: 10.1.0.4
+      pid: 5841
+      should_checkpoint: true
+      time_since_restore: 272.9811518192291
+      time_this_iter_s: 26.669344663619995
+      time_total_s: 272.9811518192291
+      timestamp: 1594805269
+      timesteps_since_restore: 0
+      training_iteration: 10
+      trial_id: d01f4_00000
+  
+    == Status ==
+    Memory usage on this node: 1.8/6.8 GiB
+    Using AsyncHyperBand: num_stopped=1
+    Bracket: Iter 8.000: -2.305310874938965 | Iter 4.000: -2.304421781921387 | Iter 2.000: -2.3075860612869263 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (9 PENDING, 1 RUNNING)
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status   | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | RUNNING  | 10.1.0.4:5841 |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | PENDING  |               |            4 |  128 |   64 | 0.000244637 |         |            |                      |
+    | DEFAULT_d01f4_00002 | PENDING  |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING  |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING  |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING  |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING  |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING  |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING  |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING  |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+----------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5842)[0m Files already downloaded and verified
+    [2m[36m(pid=5842)[0m Files already downloaded and verified
+    [2m[36m(pid=5842)[0m [1,  2000] loss: 2.304
+    [2m[36m(pid=5842)[0m [1,  4000] loss: 1.148
+    [2m[36m(pid=5842)[0m [1,  6000] loss: 0.740
+    [2m[36m(pid=5842)[0m [1,  8000] loss: 0.500
+    [2m[36m(pid=5842)[0m [1, 10000] loss: 0.377
+    Result for DEFAULT_d01f4_00001:
+      accuracy: 0.3147
+      date: 2020-07-15_09-28-37
+      done: false
+      experiment_id: d9e77e6f2b5a4ed8af0c0f986f914645
+      experiment_tag: 1_batch_size=4,l1=128,l2=64,lr=0.00024464
+      hostname: fv-az18
+      iterations_since_restore: 1
+      loss: 1.8338591158866882
+      node_ip: 10.1.0.4
+      pid: 5842
+      should_checkpoint: true
+      time_since_restore: 46.72432279586792
+      time_this_iter_s: 46.72432279586792
+      time_total_s: 46.72432279586792
+      timestamp: 1594805317
+      timesteps_since_restore: 0
+      training_iteration: 1
+      trial_id: d01f4_00001
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=1
+    Bracket: Iter 8.000: -2.305310874938965 | Iter 4.000: -2.304421781921387 | Iter 2.000: -2.3075860612869263 | Iter 1.000: -2.069442465829849
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (8 PENDING, 1 RUNNING, 1 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | RUNNING    | 10.1.0.4:5842 |            4 |  128 |   64 | 0.000244637 | 1.83386 |     0.3147 |                    1 |
+    | DEFAULT_d01f4_00002 | PENDING    |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING    |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING    |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING    |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5842)[0m [2,  2000] loss: 1.791
+    [2m[36m(pid=5842)[0m [2,  4000] loss: 0.865
+    [2m[36m(pid=5842)[0m [2,  6000] loss: 0.559
+    [2m[36m(pid=5842)[0m [2,  8000] loss: 0.410
+    [2m[36m(pid=5842)[0m [2, 10000] loss: 0.320
+    Result for DEFAULT_d01f4_00001:
+      accuracy: 0.4224
+      date: 2020-07-15_09-29-22
+      done: false
+      experiment_id: d9e77e6f2b5a4ed8af0c0f986f914645
+      experiment_tag: 1_batch_size=4,l1=128,l2=64,lr=0.00024464
+      hostname: fv-az18
+      iterations_since_restore: 2
+      loss: 1.5742607457160949
+      node_ip: 10.1.0.4
+      pid: 5842
+      should_checkpoint: true
+      time_since_restore: 91.81604790687561
+      time_this_iter_s: 45.09172511100769
+      time_total_s: 91.81604790687561
+      timestamp: 1594805362
+      timesteps_since_restore: 0
+      training_iteration: 2
+      trial_id: d01f4_00001
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=1
+    Bracket: Iter 8.000: -2.305310874938965 | Iter 4.000: -2.304421781921387 | Iter 2.000: -1.9409234035015106 | Iter 1.000: -2.069442465829849
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (8 PENDING, 1 RUNNING, 1 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | RUNNING    | 10.1.0.4:5842 |            4 |  128 |   64 | 0.000244637 | 1.57426 |     0.4224 |                    2 |
+    | DEFAULT_d01f4_00002 | PENDING    |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING    |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING    |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING    |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5842)[0m [3,  2000] loss: 1.580
+    [2m[36m(pid=5842)[0m [3,  4000] loss: 0.769
+    [2m[36m(pid=5842)[0m [3,  6000] loss: 0.503
+    [2m[36m(pid=5842)[0m [3,  8000] loss: 0.371
+    [2m[36m(pid=5842)[0m [3, 10000] loss: 0.290
+    Result for DEFAULT_d01f4_00001:
+      accuracy: 0.4775
+      date: 2020-07-15_09-30-06
+      done: false
+      experiment_id: d9e77e6f2b5a4ed8af0c0f986f914645
+      experiment_tag: 1_batch_size=4,l1=128,l2=64,lr=0.00024464
+      hostname: fv-az18
+      iterations_since_restore: 3
+      loss: 1.4537346875071526
+      node_ip: 10.1.0.4
+      pid: 5842
+      should_checkpoint: true
+      time_since_restore: 136.06298208236694
+      time_this_iter_s: 44.24693417549133
+      time_total_s: 136.06298208236694
+      timestamp: 1594805406
+      timesteps_since_restore: 0
+      training_iteration: 3
+      trial_id: d01f4_00001
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=1
+    Bracket: Iter 8.000: -2.305310874938965 | Iter 4.000: -2.304421781921387 | Iter 2.000: -1.9409234035015106 | Iter 1.000: -2.069442465829849
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (8 PENDING, 1 RUNNING, 1 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | RUNNING    | 10.1.0.4:5842 |            4 |  128 |   64 | 0.000244637 | 1.45373 |     0.4775 |                    3 |
+    | DEFAULT_d01f4_00002 | PENDING    |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING    |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING    |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING    |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5842)[0m [4,  2000] loss: 1.417
+    [2m[36m(pid=5842)[0m [4,  4000] loss: 0.711
+    [2m[36m(pid=5842)[0m [4,  6000] loss: 0.461
+    [2m[36m(pid=5842)[0m [4,  8000] loss: 0.348
+    [2m[36m(pid=5842)[0m [4, 10000] loss: 0.271
+    Result for DEFAULT_d01f4_00001:
+      accuracy: 0.4968
+      date: 2020-07-15_09-30-50
+      done: false
+      experiment_id: d9e77e6f2b5a4ed8af0c0f986f914645
+      experiment_tag: 1_batch_size=4,l1=128,l2=64,lr=0.00024464
+      hostname: fv-az18
+      iterations_since_restore: 4
+      loss: 1.4050283111929893
+      node_ip: 10.1.0.4
+      pid: 5842
+      should_checkpoint: true
+      time_since_restore: 180.2146577835083
+      time_this_iter_s: 44.15167570114136
+      time_total_s: 180.2146577835083
+      timestamp: 1594805450
+      timesteps_since_restore: 0
+      training_iteration: 4
+      trial_id: d01f4_00001
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=1
+    Bracket: Iter 8.000: -2.305310874938965 | Iter 4.000: -1.854725046557188 | Iter 2.000: -1.9409234035015106 | Iter 1.000: -2.069442465829849
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (8 PENDING, 1 RUNNING, 1 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | RUNNING    | 10.1.0.4:5842 |            4 |  128 |   64 | 0.000244637 | 1.40503 |     0.4968 |                    4 |
+    | DEFAULT_d01f4_00002 | PENDING    |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING    |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING    |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING    |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5842)[0m [5,  2000] loss: 1.329
+    [2m[36m(pid=5842)[0m [5,  4000] loss: 0.660
+    [2m[36m(pid=5842)[0m [5,  6000] loss: 0.437
+    [2m[36m(pid=5842)[0m [5,  8000] loss: 0.324
+    [2m[36m(pid=5842)[0m [5, 10000] loss: 0.261
+    Result for DEFAULT_d01f4_00001:
+      accuracy: 0.5346
+      date: 2020-07-15_09-31-34
+      done: false
+      experiment_id: d9e77e6f2b5a4ed8af0c0f986f914645
+      experiment_tag: 1_batch_size=4,l1=128,l2=64,lr=0.00024464
+      hostname: fv-az18
+      iterations_since_restore: 5
+      loss: 1.2874420422375201
+      node_ip: 10.1.0.4
+      pid: 5842
+      should_checkpoint: true
+      time_since_restore: 223.9024477005005
+      time_this_iter_s: 43.68778991699219
+      time_total_s: 223.9024477005005
+      timestamp: 1594805494
+      timesteps_since_restore: 0
+      training_iteration: 5
+      trial_id: d01f4_00001
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=1
+    Bracket: Iter 8.000: -2.305310874938965 | Iter 4.000: -1.854725046557188 | Iter 2.000: -1.9409234035015106 | Iter 1.000: -2.069442465829849
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (8 PENDING, 1 RUNNING, 1 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | RUNNING    | 10.1.0.4:5842 |            4 |  128 |   64 | 0.000244637 | 1.28744 |     0.5346 |                    5 |
+    | DEFAULT_d01f4_00002 | PENDING    |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING    |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING    |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING    |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5842)[0m [6,  2000] loss: 1.250
+    [2m[36m(pid=5842)[0m [6,  4000] loss: 0.633
+    [2m[36m(pid=5842)[0m [6,  6000] loss: 0.417
+    [2m[36m(pid=5842)[0m [6,  8000] loss: 0.309
+    [2m[36m(pid=5842)[0m [6, 10000] loss: 0.245
+    Result for DEFAULT_d01f4_00001:
+      accuracy: 0.5369
+      date: 2020-07-15_09-32-18
+      done: false
+      experiment_id: d9e77e6f2b5a4ed8af0c0f986f914645
+      experiment_tag: 1_batch_size=4,l1=128,l2=64,lr=0.00024464
+      hostname: fv-az18
+      iterations_since_restore: 6
+      loss: 1.2968578628212213
+      node_ip: 10.1.0.4
+      pid: 5842
+      should_checkpoint: true
+      time_since_restore: 268.17743253707886
+      time_this_iter_s: 44.27498483657837
+      time_total_s: 268.17743253707886
+      timestamp: 1594805538
+      timesteps_since_restore: 0
+      training_iteration: 6
+      trial_id: d01f4_00001
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=1
+    Bracket: Iter 8.000: -2.305310874938965 | Iter 4.000: -1.854725046557188 | Iter 2.000: -1.9409234035015106 | Iter 1.000: -2.069442465829849
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (8 PENDING, 1 RUNNING, 1 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | RUNNING    | 10.1.0.4:5842 |            4 |  128 |   64 | 0.000244637 | 1.29686 |     0.5369 |                    6 |
+    | DEFAULT_d01f4_00002 | PENDING    |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING    |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING    |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING    |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5842)[0m [7,  2000] loss: 1.197
+    [2m[36m(pid=5842)[0m [7,  4000] loss: 0.603
+    [2m[36m(pid=5842)[0m [7,  6000] loss: 0.395
+    [2m[36m(pid=5842)[0m [7,  8000] loss: 0.295
+    [2m[36m(pid=5842)[0m [7, 10000] loss: 0.238
+    Result for DEFAULT_d01f4_00001:
+      accuracy: 0.5667
+      date: 2020-07-15_09-33-03
+      done: false
+      experiment_id: d9e77e6f2b5a4ed8af0c0f986f914645
+      experiment_tag: 1_batch_size=4,l1=128,l2=64,lr=0.00024464
+      hostname: fv-az18
+      iterations_since_restore: 7
+      loss: 1.2226768829107284
+      node_ip: 10.1.0.4
+      pid: 5842
+      should_checkpoint: true
+      time_since_restore: 312.72258853912354
+      time_this_iter_s: 44.54515600204468
+      time_total_s: 312.72258853912354
+      timestamp: 1594805583
+      timesteps_since_restore: 0
+      training_iteration: 7
+      trial_id: d01f4_00001
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=1
+    Bracket: Iter 8.000: -2.305310874938965 | Iter 4.000: -1.854725046557188 | Iter 2.000: -1.9409234035015106 | Iter 1.000: -2.069442465829849
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (8 PENDING, 1 RUNNING, 1 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | RUNNING    | 10.1.0.4:5842 |            4 |  128 |   64 | 0.000244637 | 1.22268 |     0.5667 |                    7 |
+    | DEFAULT_d01f4_00002 | PENDING    |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING    |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING    |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING    |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5842)[0m [8,  2000] loss: 1.125
+    [2m[36m(pid=5842)[0m [8,  4000] loss: 0.567
+    [2m[36m(pid=5842)[0m [8,  6000] loss: 0.384
+    [2m[36m(pid=5842)[0m [8,  8000] loss: 0.288
+    [2m[36m(pid=5842)[0m [8, 10000] loss: 0.230
+    Result for DEFAULT_d01f4_00001:
+      accuracy: 0.5662
+      date: 2020-07-15_09-33-47
+      done: false
+      experiment_id: d9e77e6f2b5a4ed8af0c0f986f914645
+      experiment_tag: 1_batch_size=4,l1=128,l2=64,lr=0.00024464
+      hostname: fv-az18
+      iterations_since_restore: 8
+      loss: 1.2095336069822311
+      node_ip: 10.1.0.4
+      pid: 5842
+      should_checkpoint: true
+      time_since_restore: 357.3847060203552
+      time_this_iter_s: 44.66211748123169
+      time_total_s: 357.3847060203552
+      timestamp: 1594805627
+      timesteps_since_restore: 0
+      training_iteration: 8
+      trial_id: d01f4_00001
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=1
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.854725046557188 | Iter 2.000: -1.9409234035015106 | Iter 1.000: -2.069442465829849
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (8 PENDING, 1 RUNNING, 1 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | RUNNING    | 10.1.0.4:5842 |            4 |  128 |   64 | 0.000244637 | 1.20953 |     0.5662 |                    8 |
+    | DEFAULT_d01f4_00002 | PENDING    |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING    |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING    |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING    |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5842)[0m [9,  2000] loss: 1.067
+    [2m[36m(pid=5842)[0m [9,  4000] loss: 0.545
+    [2m[36m(pid=5842)[0m [9,  6000] loss: 0.377
+    [2m[36m(pid=5842)[0m [9,  8000] loss: 0.277
+    [2m[36m(pid=5842)[0m [9, 10000] loss: 0.221
+    Result for DEFAULT_d01f4_00001:
+      accuracy: 0.5872
+      date: 2020-07-15_09-34-32
+      done: false
+      experiment_id: d9e77e6f2b5a4ed8af0c0f986f914645
+      experiment_tag: 1_batch_size=4,l1=128,l2=64,lr=0.00024464
+      hostname: fv-az18
+      iterations_since_restore: 9
+      loss: 1.161626017406583
+      node_ip: 10.1.0.4
+      pid: 5842
+      should_checkpoint: true
+      time_since_restore: 402.0385947227478
+      time_this_iter_s: 44.65388870239258
+      time_total_s: 402.0385947227478
+      timestamp: 1594805672
+      timesteps_since_restore: 0
+      training_iteration: 9
+      trial_id: d01f4_00001
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=1
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.854725046557188 | Iter 2.000: -1.9409234035015106 | Iter 1.000: -2.069442465829849
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (8 PENDING, 1 RUNNING, 1 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | RUNNING    | 10.1.0.4:5842 |            4 |  128 |   64 | 0.000244637 | 1.16163 |     0.5872 |                    9 |
+    | DEFAULT_d01f4_00002 | PENDING    |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING    |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING    |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING    |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=5842)[0m [10,  2000] loss: 1.038
+    [2m[36m(pid=5842)[0m [10,  4000] loss: 0.527
+    [2m[36m(pid=5842)[0m [10,  6000] loss: 0.357
+    [2m[36m(pid=5842)[0m [10,  8000] loss: 0.270
+    [2m[36m(pid=5842)[0m [10, 10000] loss: 0.210
+    Result for DEFAULT_d01f4_00001:
+      accuracy: 0.5759
+      date: 2020-07-15_09-35-16
+      done: true
+      experiment_id: d9e77e6f2b5a4ed8af0c0f986f914645
+      experiment_tag: 1_batch_size=4,l1=128,l2=64,lr=0.00024464
+      hostname: fv-az18
+      iterations_since_restore: 10
+      loss: 1.1990941143661737
+      node_ip: 10.1.0.4
+      pid: 5842
+      should_checkpoint: true
+      time_since_restore: 446.0193748474121
+      time_this_iter_s: 43.98078012466431
+      time_total_s: 446.0193748474121
+      timestamp: 1594805716
+      timesteps_since_restore: 0
+      training_iteration: 10
+      trial_id: d01f4_00001
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=2
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.854725046557188 | Iter 2.000: -1.9409234035015106 | Iter 1.000: -2.069442465829849
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (8 PENDING, 1 RUNNING, 1 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | RUNNING    | 10.1.0.4:5842 |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | PENDING    |               |           16 |  256 |    8 | 0.0880943   |         |            |                      |
+    | DEFAULT_d01f4_00003 | PENDING    |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING    |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING    |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=7724)[0m Files already downloaded and verified
+    [2m[36m(pid=7724)[0m Files already downloaded and verified
+    [2m[36m(pid=7724)[0m [1,  2000] loss: 2.303
+    Result for DEFAULT_d01f4_00002:
+      accuracy: 0.1048
+      date: 2020-07-15_09-35-40
+      done: true
+      experiment_id: 7dafc44dc66843489ad3570a77a34520
+      experiment_tag: 2_batch_size=16,l1=256,l2=8,lr=0.088094
+      hostname: fv-az18
+      iterations_since_restore: 1
+      loss: 2.3082128185272217
+      node_ip: 10.1.0.4
+      pid: 7724
+      should_checkpoint: true
+      time_since_restore: 22.726823568344116
+      time_this_iter_s: 22.726823568344116
+      time_total_s: 22.726823568344116
+      timestamp: 1594805740
+      timesteps_since_restore: 0
+      training_iteration: 1
+      trial_id: d01f4_00002
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=3
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.854725046557188 | Iter 2.000: -1.9409234035015106 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (7 PENDING, 1 RUNNING, 2 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | RUNNING    | 10.1.0.4:7724 |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | PENDING    |               |            2 |  128 |  256 | 0.0291105   |         |            |                      |
+    | DEFAULT_d01f4_00004 | PENDING    |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING    |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=7822)[0m Files already downloaded and verified
+    [2m[36m(pid=7822)[0m Files already downloaded and verified
+    [2m[36m(pid=7822)[0m [1,  2000] loss: 2.337
+    [2m[36m(pid=7822)[0m [1,  4000] loss: 1.167
+    [2m[36m(pid=7822)[0m [1,  6000] loss: 0.779
+    [2m[36m(pid=7822)[0m [1,  8000] loss: 0.584
+    [2m[36m(pid=7822)[0m [1, 10000] loss: 0.467
+    [2m[36m(pid=7822)[0m [1, 12000] loss: 0.389
+    [2m[36m(pid=7822)[0m [1, 14000] loss: 0.334
+    [2m[36m(pid=7822)[0m [1, 16000] loss: 0.292
+    [2m[36m(pid=7822)[0m [1, 18000] loss: 0.260
+    [2m[36m(pid=7822)[0m [1, 20000] loss: 0.234
+    Result for DEFAULT_d01f4_00003:
+      accuracy: 0.0988
+      date: 2020-07-15_09-37-26
+      done: true
+      experiment_id: fccf899240694a4f87bf36821f75d3cb
+      experiment_tag: 3_batch_size=2,l1=128,l2=256,lr=0.02911
+      hostname: fv-az18
+      iterations_since_restore: 1
+      loss: 2.3150227838516235
+      node_ip: 10.1.0.4
+      pid: 7822
+      should_checkpoint: true
+      time_since_restore: 105.49419093132019
+      time_this_iter_s: 105.49419093132019
+      time_total_s: 105.49419093132019
+      timestamp: 1594805846
+      timesteps_since_restore: 0
+      training_iteration: 1
+      trial_id: d01f4_00003
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=4
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.854725046557188 | Iter 2.000: -1.9409234035015106 | Iter 1.000: -2.306619317150116
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (6 PENDING, 1 RUNNING, 3 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | RUNNING    | 10.1.0.4:7822 |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | PENDING    |               |            8 |   64 |   16 | 0.0602952   |         |            |                      |
+    | DEFAULT_d01f4_00005 | PENDING    |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=7970)[0m Files already downloaded and verified
+    [2m[36m(pid=7970)[0m Files already downloaded and verified
+    [2m[36m(pid=7970)[0m [1,  2000] loss: 2.291
+    [2m[36m(pid=7970)[0m [1,  4000] loss: 1.160
+    Result for DEFAULT_d01f4_00004:
+      accuracy: 0.1009
+      date: 2020-07-15_09-37-57
+      done: true
+      experiment_id: dcfce39c482e40eba029459a7982a545
+      experiment_tag: 4_batch_size=8,l1=64,l2=16,lr=0.060295
+      hostname: fv-az18
+      iterations_since_restore: 1
+      loss: 2.3199959348678587
+      node_ip: 10.1.0.4
+      pid: 7970
+      should_checkpoint: true
+      time_since_restore: 29.819358348846436
+      time_this_iter_s: 29.819358348846436
+      time_total_s: 29.819358348846436
+      timestamp: 1594805877
+      timesteps_since_restore: 0
+      training_iteration: 1
+      trial_id: d01f4_00004
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=5
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.854725046557188 | Iter 2.000: -1.9409234035015106 | Iter 1.000: -2.3082128185272217
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (5 PENDING, 1 RUNNING, 4 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | RUNNING    | 10.1.0.4:7970 |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | PENDING    |               |            8 |    4 |   64 | 0.000120017 |         |            |                      |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=8070)[0m Files already downloaded and verified
+    [2m[36m(pid=8070)[0m Files already downloaded and verified
+    [2m[36m(pid=8070)[0m [1,  2000] loss: 2.306
+    [2m[36m(pid=8070)[0m [1,  4000] loss: 1.151
+    Result for DEFAULT_d01f4_00005:
+      accuracy: 0.1494
+      date: 2020-07-15_09-38-28
+      done: false
+      experiment_id: 11c155a1bbba4086852f1da4a13e812e
+      experiment_tag: 5_batch_size=8,l1=4,l2=64,lr=0.00012002
+      hostname: fv-az18
+      iterations_since_restore: 1
+      loss: 2.2992740266799925
+      node_ip: 10.1.0.4
+      pid: 8070
+      should_checkpoint: true
+      time_since_restore: 29.23026704788208
+      time_this_iter_s: 29.23026704788208
+      time_total_s: 29.23026704788208
+      timestamp: 1594805908
+      timesteps_since_restore: 0
+      training_iteration: 1
+      trial_id: d01f4_00005
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=5
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.854725046557188 | Iter 2.000: -1.9409234035015106 | Iter 1.000: -2.306619317150116
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (4 PENDING, 1 RUNNING, 5 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | RUNNING    | 10.1.0.4:8070 |            8 |    4 |   64 | 0.000120017 | 2.29927 |     0.1494 |                    1 |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=8070)[0m [2,  2000] loss: 2.294
+    [2m[36m(pid=8070)[0m [2,  4000] loss: 1.127
+    Result for DEFAULT_d01f4_00005:
+      accuracy: 0.2197
+      date: 2020-07-15_09-38-55
+      done: true
+      experiment_id: 11c155a1bbba4086852f1da4a13e812e
+      experiment_tag: 5_batch_size=8,l1=4,l2=64,lr=0.00012002
+      hostname: fv-az18
+      iterations_since_restore: 2
+      loss: 2.166290110874176
+      node_ip: 10.1.0.4
+      pid: 8070
+      should_checkpoint: true
+      time_since_restore: 56.197264194488525
+      time_this_iter_s: 26.966997146606445
+      time_total_s: 56.197264194488525
+      timestamp: 1594805935
+      timesteps_since_restore: 0
+      training_iteration: 2
+      trial_id: d01f4_00005
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=6
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.854725046557188 | Iter 2.000: -2.166290110874176 | Iter 1.000: -2.306619317150116
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (4 PENDING, 1 RUNNING, 5 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | RUNNING    | 10.1.0.4:8070 |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | PENDING    |               |            2 |  256 |  256 | 0.00145522  |         |            |                      |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=8260)[0m Files already downloaded and verified
+    [2m[36m(pid=8260)[0m Files already downloaded and verified
+    [2m[36m(pid=8260)[0m [1,  2000] loss: 2.163
+    [2m[36m(pid=8260)[0m [1,  4000] loss: 0.938
+    [2m[36m(pid=8260)[0m [1,  6000] loss: 0.578
+    [2m[36m(pid=8260)[0m [1,  8000] loss: 0.415
+    [2m[36m(pid=8260)[0m [1, 10000] loss: 0.320
+    [2m[36m(pid=8260)[0m [1, 12000] loss: 0.262
+    [2m[36m(pid=8260)[0m [1, 14000] loss: 0.220
+    [2m[36m(pid=8260)[0m [1, 16000] loss: 0.187
+    [2m[36m(pid=8260)[0m [1, 18000] loss: 0.164
+    [2m[36m(pid=8260)[0m [1, 20000] loss: 0.145
+    Result for DEFAULT_d01f4_00006:
+      accuracy: 0.455
+      date: 2020-07-15_09-40-24
+      done: false
+      experiment_id: 11def7c3a94247008b957dae886b5af2
+      experiment_tag: 6_batch_size=2,l1=256,l2=256,lr=0.0014552
+      hostname: fv-az18
+      iterations_since_restore: 1
+      loss: 1.4793898952998221
+      node_ip: 10.1.0.4
+      pid: 8260
+      should_checkpoint: true
+      time_since_restore: 88.56605553627014
+      time_this_iter_s: 88.56605553627014
+      time_total_s: 88.56605553627014
+      timestamp: 1594806024
+      timesteps_since_restore: 0
+      training_iteration: 1
+      trial_id: d01f4_00006
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=6
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.854725046557188 | Iter 2.000: -2.166290110874176 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (3 PENDING, 1 RUNNING, 6 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | RUNNING    | 10.1.0.4:8260 |            2 |  256 |  256 | 0.00145522  | 1.47939 |     0.455  |                    1 |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=8260)[0m [2,  2000] loss: 1.386
+    [2m[36m(pid=8260)[0m [2,  4000] loss: 0.703
+    [2m[36m(pid=8260)[0m [2,  6000] loss: 0.453
+    [2m[36m(pid=8260)[0m [2,  8000] loss: 0.343
+    [2m[36m(pid=8260)[0m [2, 10000] loss: 0.266
+    [2m[36m(pid=8260)[0m [2, 12000] loss: 0.225
+    [2m[36m(pid=8260)[0m [2, 14000] loss: 0.194
+    [2m[36m(pid=8260)[0m [2, 16000] loss: 0.169
+    [2m[36m(pid=8260)[0m [2, 18000] loss: 0.148
+    [2m[36m(pid=8260)[0m [2, 20000] loss: 0.133
+    Result for DEFAULT_d01f4_00006:
+      accuracy: 0.5269
+      date: 2020-07-15_09-41-50
+      done: false
+      experiment_id: 11def7c3a94247008b957dae886b5af2
+      experiment_tag: 6_batch_size=2,l1=256,l2=256,lr=0.0014552
+      hostname: fv-az18
+      iterations_since_restore: 2
+      loss: 1.3388296814362868
+      node_ip: 10.1.0.4
+      pid: 8260
+      should_checkpoint: true
+      time_since_restore: 174.70733451843262
+      time_this_iter_s: 86.14127898216248
+      time_total_s: 174.70733451843262
+      timestamp: 1594806110
+      timesteps_since_restore: 0
+      training_iteration: 2
+      trial_id: d01f4_00006
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=6
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.854725046557188 | Iter 2.000: -1.8702754282951355 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (3 PENDING, 1 RUNNING, 6 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | RUNNING    | 10.1.0.4:8260 |            2 |  256 |  256 | 0.00145522  | 1.33883 |     0.5269 |                    2 |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=8260)[0m [3,  2000] loss: 1.228
+    [2m[36m(pid=8260)[0m [3,  4000] loss: 0.614
+    [2m[36m(pid=8260)[0m [3,  6000] loss: 0.415
+    [2m[36m(pid=8260)[0m [3,  8000] loss: 0.314
+    [2m[36m(pid=8260)[0m [3, 10000] loss: 0.250
+    [2m[36m(pid=8260)[0m [3, 12000] loss: 0.209
+    [2m[36m(pid=8260)[0m [3, 14000] loss: 0.180
+    [2m[36m(pid=8260)[0m [3, 16000] loss: 0.163
+    [2m[36m(pid=8260)[0m [3, 18000] loss: 0.140
+    [2m[36m(pid=8260)[0m [3, 20000] loss: 0.125
+    Result for DEFAULT_d01f4_00006:
+      accuracy: 0.5576
+      date: 2020-07-15_09-43-18
+      done: false
+      experiment_id: 11def7c3a94247008b957dae886b5af2
+      experiment_tag: 6_batch_size=2,l1=256,l2=256,lr=0.0014552
+      hostname: fv-az18
+      iterations_since_restore: 3
+      loss: 1.2572260664541042
+      node_ip: 10.1.0.4
+      pid: 8260
+      should_checkpoint: true
+      time_since_restore: 262.8162705898285
+      time_this_iter_s: 88.10893607139587
+      time_total_s: 262.8162705898285
+      timestamp: 1594806198
+      timesteps_since_restore: 0
+      training_iteration: 3
+      trial_id: d01f4_00006
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=6
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.854725046557188 | Iter 2.000: -1.8702754282951355 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (3 PENDING, 1 RUNNING, 6 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | RUNNING    | 10.1.0.4:8260 |            2 |  256 |  256 | 0.00145522  | 1.25723 |     0.5576 |                    3 |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=8260)[0m [4,  2000] loss: 1.127
+    [2m[36m(pid=8260)[0m [4,  4000] loss: 0.568
+    [2m[36m(pid=8260)[0m [4,  6000] loss: 0.397
+    [2m[36m(pid=8260)[0m [4,  8000] loss: 0.294
+    [2m[36m(pid=8260)[0m [4, 10000] loss: 0.240
+    [2m[36m(pid=8260)[0m [4, 12000] loss: 0.203
+    [2m[36m(pid=8260)[0m [4, 14000] loss: 0.168
+    [2m[36m(pid=8260)[0m [4, 16000] loss: 0.152
+    [2m[36m(pid=8260)[0m [4, 18000] loss: 0.138
+    [2m[36m(pid=8260)[0m [4, 20000] loss: 0.123
+    Result for DEFAULT_d01f4_00006:
+      accuracy: 0.5626
+      date: 2020-07-15_09-44-46
+      done: false
+      experiment_id: 11def7c3a94247008b957dae886b5af2
+      experiment_tag: 6_batch_size=2,l1=256,l2=256,lr=0.0014552
+      hostname: fv-az18
+      iterations_since_restore: 4
+      loss: 1.2589706258581137
+      node_ip: 10.1.0.4
+      pid: 8260
+      should_checkpoint: true
+      time_since_restore: 350.869500875473
+      time_this_iter_s: 88.05323028564453
+      time_total_s: 350.869500875473
+      timestamp: 1594806286
+      timesteps_since_restore: 0
+      training_iteration: 4
+      trial_id: d01f4_00006
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=6
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.4050283111929893 | Iter 2.000: -1.8702754282951355 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (3 PENDING, 1 RUNNING, 6 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | RUNNING    | 10.1.0.4:8260 |            2 |  256 |  256 | 0.00145522  | 1.25897 |     0.5626 |                    4 |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=8260)[0m [5,  2000] loss: 1.100
+    [2m[36m(pid=8260)[0m [5,  4000] loss: 0.552
+    [2m[36m(pid=8260)[0m [5,  6000] loss: 0.366
+    [2m[36m(pid=8260)[0m [5,  8000] loss: 0.286
+    [2m[36m(pid=8260)[0m [5, 10000] loss: 0.230
+    [2m[36m(pid=8260)[0m [5, 12000] loss: 0.186
+    [2m[36m(pid=8260)[0m [5, 14000] loss: 0.166
+    [2m[36m(pid=8260)[0m [5, 16000] loss: 0.142
+    [2m[36m(pid=8260)[0m [5, 18000] loss: 0.130
+    [2m[36m(pid=8260)[0m [5, 20000] loss: 0.120
+    Result for DEFAULT_d01f4_00006:
+      accuracy: 0.5455
+      date: 2020-07-15_09-46-15
+      done: false
+      experiment_id: 11def7c3a94247008b957dae886b5af2
+      experiment_tag: 6_batch_size=2,l1=256,l2=256,lr=0.0014552
+      hostname: fv-az18
+      iterations_since_restore: 5
+      loss: 1.3557017856473628
+      node_ip: 10.1.0.4
+      pid: 8260
+      should_checkpoint: true
+      time_since_restore: 439.8247196674347
+      time_this_iter_s: 88.95521879196167
+      time_total_s: 439.8247196674347
+      timestamp: 1594806375
+      timesteps_since_restore: 0
+      training_iteration: 5
+      trial_id: d01f4_00006
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=6
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.4050283111929893 | Iter 2.000: -1.8702754282951355 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (3 PENDING, 1 RUNNING, 6 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | RUNNING    | 10.1.0.4:8260 |            2 |  256 |  256 | 0.00145522  | 1.3557  |     0.5455 |                    5 |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=8260)[0m [6,  2000] loss: 1.039
+    [2m[36m(pid=8260)[0m [6,  4000] loss: 0.534
+    [2m[36m(pid=8260)[0m [6,  6000] loss: 0.366
+    [2m[36m(pid=8260)[0m [6,  8000] loss: 0.269
+    [2m[36m(pid=8260)[0m [6, 10000] loss: 0.228
+    [2m[36m(pid=8260)[0m [6, 12000] loss: 0.180
+    [2m[36m(pid=8260)[0m [6, 14000] loss: 0.168
+    [2m[36m(pid=8260)[0m [6, 16000] loss: 0.144
+    [2m[36m(pid=8260)[0m [6, 18000] loss: 0.126
+    [2m[36m(pid=8260)[0m [6, 20000] loss: 0.117
+    Result for DEFAULT_d01f4_00006:
+      accuracy: 0.5445
+      date: 2020-07-15_09-47-44
+      done: false
+      experiment_id: 11def7c3a94247008b957dae886b5af2
+      experiment_tag: 6_batch_size=2,l1=256,l2=256,lr=0.0014552
+      hostname: fv-az18
+      iterations_since_restore: 6
+      loss: 1.3603807810001904
+      node_ip: 10.1.0.4
+      pid: 8260
+      should_checkpoint: true
+      time_since_restore: 528.0880856513977
+      time_this_iter_s: 88.26336598396301
+      time_total_s: 528.0880856513977
+      timestamp: 1594806464
+      timesteps_since_restore: 0
+      training_iteration: 6
+      trial_id: d01f4_00006
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=6
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.4050283111929893 | Iter 2.000: -1.8702754282951355 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (3 PENDING, 1 RUNNING, 6 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | RUNNING    | 10.1.0.4:8260 |            2 |  256 |  256 | 0.00145522  | 1.36038 |     0.5445 |                    6 |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=8260)[0m [7,  2000] loss: 1.036
+    [2m[36m(pid=8260)[0m [7,  4000] loss: 0.517
+    [2m[36m(pid=8260)[0m [7,  6000] loss: 0.359
+    [2m[36m(pid=8260)[0m [7,  8000] loss: 0.270
+    [2m[36m(pid=8260)[0m [7, 10000] loss: 0.228
+    [2m[36m(pid=8260)[0m [7, 12000] loss: 0.188
+    [2m[36m(pid=8260)[0m [7, 14000] loss: 0.164
+    [2m[36m(pid=8260)[0m [7, 16000] loss: 0.146
+    [2m[36m(pid=8260)[0m [7, 18000] loss: 0.130
+    [2m[36m(pid=8260)[0m [7, 20000] loss: 0.111
+    Result for DEFAULT_d01f4_00006:
+      accuracy: 0.5551
+      date: 2020-07-15_09-49-13
+      done: false
+      experiment_id: 11def7c3a94247008b957dae886b5af2
+      experiment_tag: 6_batch_size=2,l1=256,l2=256,lr=0.0014552
+      hostname: fv-az18
+      iterations_since_restore: 7
+      loss: 1.362786349601822
+      node_ip: 10.1.0.4
+      pid: 8260
+      should_checkpoint: true
+      time_since_restore: 617.196103811264
+      time_this_iter_s: 89.10801815986633
+      time_total_s: 617.196103811264
+      timestamp: 1594806553
+      timesteps_since_restore: 0
+      training_iteration: 7
+      trial_id: d01f4_00006
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=6
+    Bracket: Iter 8.000: -1.757422240960598 | Iter 4.000: -1.4050283111929893 | Iter 2.000: -1.8702754282951355 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (3 PENDING, 1 RUNNING, 6 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | RUNNING    | 10.1.0.4:8260 |            2 |  256 |  256 | 0.00145522  | 1.36279 |     0.5551 |                    7 |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=8260)[0m [8,  2000] loss: 0.986
+    [2m[36m(pid=8260)[0m [8,  4000] loss: 0.517
+    [2m[36m(pid=8260)[0m [8,  6000] loss: 0.356
+    [2m[36m(pid=8260)[0m [8,  8000] loss: 0.266
+    [2m[36m(pid=8260)[0m [8, 10000] loss: 0.215
+    [2m[36m(pid=8260)[0m [8, 12000] loss: 0.187
+    [2m[36m(pid=8260)[0m [8, 14000] loss: 0.171
+    [2m[36m(pid=8260)[0m [8, 16000] loss: 0.139
+    [2m[36m(pid=8260)[0m [8, 18000] loss: 0.126
+    [2m[36m(pid=8260)[0m [8, 20000] loss: 0.116
+    Result for DEFAULT_d01f4_00006:
+      accuracy: 0.5281
+      date: 2020-07-15_09-50-42
+      done: false
+      experiment_id: 11def7c3a94247008b957dae886b5af2
+      experiment_tag: 6_batch_size=2,l1=256,l2=256,lr=0.0014552
+      hostname: fv-az18
+      iterations_since_restore: 8
+      loss: 1.4494488952221563
+      node_ip: 10.1.0.4
+      pid: 8260
+      should_checkpoint: true
+      time_since_restore: 706.7959880828857
+      time_this_iter_s: 89.5998842716217
+      time_total_s: 706.7959880828857
+      timestamp: 1594806642
+      timesteps_since_restore: 0
+      training_iteration: 8
+      trial_id: d01f4_00006
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=6
+    Bracket: Iter 8.000: -1.4494488952221563 | Iter 4.000: -1.4050283111929893 | Iter 2.000: -1.8702754282951355 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (3 PENDING, 1 RUNNING, 6 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | RUNNING    | 10.1.0.4:8260 |            2 |  256 |  256 | 0.00145522  | 1.44945 |     0.5281 |                    8 |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=8260)[0m [9,  2000] loss: 1.009
+    [2m[36m(pid=8260)[0m [9,  4000] loss: 0.501
+    [2m[36m(pid=8260)[0m [9,  6000] loss: 0.362
+    [2m[36m(pid=8260)[0m [9,  8000] loss: 0.264
+    [2m[36m(pid=8260)[0m [9, 10000] loss: 0.217
+    [2m[36m(pid=8260)[0m [9, 12000] loss: 0.186
+    [2m[36m(pid=8260)[0m [9, 14000] loss: 0.160
+    [2m[36m(pid=8260)[0m [9, 16000] loss: 0.140
+    [2m[36m(pid=8260)[0m [9, 18000] loss: 0.126
+    [2m[36m(pid=8260)[0m [9, 20000] loss: 0.115
+    Result for DEFAULT_d01f4_00006:
+      accuracy: 0.5199
+      date: 2020-07-15_09-52-12
+      done: false
+      experiment_id: 11def7c3a94247008b957dae886b5af2
+      experiment_tag: 6_batch_size=2,l1=256,l2=256,lr=0.0014552
+      hostname: fv-az18
+      iterations_since_restore: 9
+      loss: 1.4884410531560592
+      node_ip: 10.1.0.4
+      pid: 8260
+      should_checkpoint: true
+      time_since_restore: 796.1786303520203
+      time_this_iter_s: 89.38264226913452
+      time_total_s: 796.1786303520203
+      timestamp: 1594806732
+      timesteps_since_restore: 0
+      training_iteration: 9
+      trial_id: d01f4_00006
+  
+    == Status ==
+    Memory usage on this node: 1.8/6.8 GiB
+    Using AsyncHyperBand: num_stopped=6
+    Bracket: Iter 8.000: -1.4494488952221563 | Iter 4.000: -1.4050283111929893 | Iter 2.000: -1.8702754282951355 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (3 PENDING, 1 RUNNING, 6 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | RUNNING    | 10.1.0.4:8260 |            2 |  256 |  256 | 0.00145522  | 1.48844 |     0.5199 |                    9 |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=8260)[0m [10,  2000] loss: 0.956
+    [2m[36m(pid=8260)[0m [10,  4000] loss: 0.498
+    [2m[36m(pid=8260)[0m [10,  6000] loss: 0.342
+    [2m[36m(pid=8260)[0m [10,  8000] loss: 0.270
+    [2m[36m(pid=8260)[0m [10, 10000] loss: 0.216
+    [2m[36m(pid=8260)[0m [10, 12000] loss: 0.188
+    [2m[36m(pid=8260)[0m [10, 14000] loss: 0.161
+    [2m[36m(pid=8260)[0m [10, 16000] loss: 0.135
+    [2m[36m(pid=8260)[0m [10, 18000] loss: 0.123
+    [2m[36m(pid=8260)[0m [10, 20000] loss: 0.114
+    Result for DEFAULT_d01f4_00006:
+      accuracy: 0.5255
+      date: 2020-07-15_09-53-43
+      done: true
+      experiment_id: 11def7c3a94247008b957dae886b5af2
+      experiment_tag: 6_batch_size=2,l1=256,l2=256,lr=0.0014552
+      hostname: fv-az18
+      iterations_since_restore: 10
+      loss: 1.5433168191457198
+      node_ip: 10.1.0.4
+      pid: 8260
+      should_checkpoint: true
+      time_since_restore: 886.8925909996033
+      time_this_iter_s: 90.71396064758301
+      time_total_s: 886.8925909996033
+      timestamp: 1594806823
+      timesteps_since_restore: 0
+      training_iteration: 10
+      trial_id: d01f4_00006
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=7
+    Bracket: Iter 8.000: -1.4494488952221563 | Iter 4.000: -1.4050283111929893 | Iter 2.000: -1.8702754282951355 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (3 PENDING, 1 RUNNING, 6 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | RUNNING    | 10.1.0.4:8260 |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | PENDING    |               |            8 |    4 |   32 | 0.058841    |         |            |                      |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=9681)[0m Files already downloaded and verified
+    [2m[36m(pid=9681)[0m Files already downloaded and verified
+    [2m[36m(pid=9681)[0m [1,  2000] loss: 2.320
+    [2m[36m(pid=9681)[0m [1,  4000] loss: 1.160
+    Result for DEFAULT_d01f4_00007:
+      accuracy: 0.1038
+      date: 2020-07-15_09-54-12
+      done: true
+      experiment_id: b8eac297badb4ea4bca1ecb2181d0d73
+      experiment_tag: 7_batch_size=8,l1=4,l2=32,lr=0.058841
+      hostname: fv-az18
+      iterations_since_restore: 1
+      loss: 2.3140802755355834
+      node_ip: 10.1.0.4
+      pid: 9681
+      should_checkpoint: true
+      time_since_restore: 28.006226301193237
+      time_this_iter_s: 28.006226301193237
+      time_total_s: 28.006226301193237
+      timestamp: 1594806852
+      timesteps_since_restore: 0
+      training_iteration: 1
+      trial_id: d01f4_00007
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=8
+    Bracket: Iter 8.000: -1.4494488952221563 | Iter 4.000: -1.4050283111929893 | Iter 2.000: -1.8702754282951355 | Iter 1.000: -2.306619317150116
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (2 PENDING, 1 RUNNING, 7 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |               |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | RUNNING    | 10.1.0.4:9681 |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | PENDING    |               |            4 |  128 |  256 | 0.000421871 |         |            |                      |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=9786)[0m Files already downloaded and verified
+    [2m[36m(pid=9786)[0m Files already downloaded and verified
+    [2m[36m(pid=9786)[0m [1,  2000] loss: 2.246
+    [2m[36m(pid=9786)[0m [1,  4000] loss: 0.988
+    [2m[36m(pid=9786)[0m [1,  6000] loss: 0.598
+    [2m[36m(pid=9786)[0m [1,  8000] loss: 0.417
+    [2m[36m(pid=9786)[0m [1, 10000] loss: 0.314
+    Result for DEFAULT_d01f4_00008:
+      accuracy: 0.4388
+      date: 2020-07-15_09-55-00
+      done: false
+      experiment_id: aa408334e5c240239e967fb42d89ef94
+      experiment_tag: 8_batch_size=4,l1=128,l2=256,lr=0.00042187
+      hostname: fv-az18
+      iterations_since_restore: 1
+      loss: 1.5226418793201446
+      node_ip: 10.1.0.4
+      pid: 9786
+      should_checkpoint: true
+      time_since_restore: 47.36518621444702
+      time_this_iter_s: 47.36518621444702
+      time_total_s: 47.36518621444702
+      timestamp: 1594806900
+      timesteps_since_restore: 0
+      training_iteration: 1
+      trial_id: d01f4_00008
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=8
+    Bracket: Iter 8.000: -1.4494488952221563 | Iter 4.000: -1.4050283111929893 | Iter 2.000: -1.8702754282951355 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (1 PENDING, 1 RUNNING, 8 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |               |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | TERMINATED |               |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | RUNNING    | 10.1.0.4:9786 |            4 |  128 |  256 | 0.000421871 | 1.52264 |     0.4388 |                    1 |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=9786)[0m [2,  2000] loss: 1.524
+    [2m[36m(pid=9786)[0m [2,  4000] loss: 0.741
+    [2m[36m(pid=9786)[0m [2,  6000] loss: 0.487
+    [2m[36m(pid=9786)[0m [2,  8000] loss: 0.357
+    [2m[36m(pid=9786)[0m [2, 10000] loss: 0.278
+    Result for DEFAULT_d01f4_00008:
+      accuracy: 0.4957
+      date: 2020-07-15_09-55-47
+      done: false
+      experiment_id: aa408334e5c240239e967fb42d89ef94
+      experiment_tag: 8_batch_size=4,l1=128,l2=256,lr=0.00042187
+      hostname: fv-az18
+      iterations_since_restore: 2
+      loss: 1.4044174455404281
+      node_ip: 10.1.0.4
+      pid: 9786
+      should_checkpoint: true
+      time_since_restore: 94.51239204406738
+      time_this_iter_s: 47.14720582962036
+      time_total_s: 94.51239204406738
+      timestamp: 1594806947
+      timesteps_since_restore: 0
+      training_iteration: 2
+      trial_id: d01f4_00008
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=8
+    Bracket: Iter 8.000: -1.4494488952221563 | Iter 4.000: -1.4050283111929893 | Iter 2.000: -1.5742607457160949 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (1 PENDING, 1 RUNNING, 8 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |               |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | TERMINATED |               |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | RUNNING    | 10.1.0.4:9786 |            4 |  128 |  256 | 0.000421871 | 1.40442 |     0.4957 |                    2 |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=9786)[0m [3,  2000] loss: 1.368
+    [2m[36m(pid=9786)[0m [3,  4000] loss: 0.667
+    [2m[36m(pid=9786)[0m [3,  6000] loss: 0.447
+    [2m[36m(pid=9786)[0m [3,  8000] loss: 0.328
+    [2m[36m(pid=9786)[0m [3, 10000] loss: 0.258
+    Result for DEFAULT_d01f4_00008:
+      accuracy: 0.5087
+      date: 2020-07-15_09-56-37
+      done: false
+      experiment_id: aa408334e5c240239e967fb42d89ef94
+      experiment_tag: 8_batch_size=4,l1=128,l2=256,lr=0.00042187
+      hostname: fv-az18
+      iterations_since_restore: 3
+      loss: 1.3490179908216
+      node_ip: 10.1.0.4
+      pid: 9786
+      should_checkpoint: true
+      time_since_restore: 144.26005864143372
+      time_this_iter_s: 49.74766659736633
+      time_total_s: 144.26005864143372
+      timestamp: 1594806997
+      timesteps_since_restore: 0
+      training_iteration: 3
+      trial_id: d01f4_00008
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=8
+    Bracket: Iter 8.000: -1.4494488952221563 | Iter 4.000: -1.4050283111929893 | Iter 2.000: -1.5742607457160949 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (1 PENDING, 1 RUNNING, 8 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |               |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | TERMINATED |               |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | RUNNING    | 10.1.0.4:9786 |            4 |  128 |  256 | 0.000421871 | 1.34902 |     0.5087 |                    3 |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=9786)[0m [4,  2000] loss: 1.256
+    [2m[36m(pid=9786)[0m [4,  4000] loss: 0.617
+    [2m[36m(pid=9786)[0m [4,  6000] loss: 0.407
+    [2m[36m(pid=9786)[0m [4,  8000] loss: 0.304
+    [2m[36m(pid=9786)[0m [4, 10000] loss: 0.243
+    Result for DEFAULT_d01f4_00008:
+      accuracy: 0.5262
+      date: 2020-07-15_09-57-24
+      done: false
+      experiment_id: aa408334e5c240239e967fb42d89ef94
+      experiment_tag: 8_batch_size=4,l1=128,l2=256,lr=0.00042187
+      hostname: fv-az18
+      iterations_since_restore: 4
+      loss: 1.3087484296858312
+      node_ip: 10.1.0.4
+      pid: 9786
+      should_checkpoint: true
+      time_since_restore: 191.71792650222778
+      time_this_iter_s: 47.45786786079407
+      time_total_s: 191.71792650222778
+      timestamp: 1594807044
+      timesteps_since_restore: 0
+      training_iteration: 4
+      trial_id: d01f4_00008
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=8
+    Bracket: Iter 8.000: -1.4494488952221563 | Iter 4.000: -1.3568883704394104 | Iter 2.000: -1.5742607457160949 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (1 PENDING, 1 RUNNING, 8 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |               |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | TERMINATED |               |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | RUNNING    | 10.1.0.4:9786 |            4 |  128 |  256 | 0.000421871 | 1.30875 |     0.5262 |                    4 |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=9786)[0m [5,  2000] loss: 1.166
+    [2m[36m(pid=9786)[0m [5,  4000] loss: 0.570
+    [2m[36m(pid=9786)[0m [5,  6000] loss: 0.380
+    [2m[36m(pid=9786)[0m [5,  8000] loss: 0.287
+    [2m[36m(pid=9786)[0m [5, 10000] loss: 0.228
+    Result for DEFAULT_d01f4_00008:
+      accuracy: 0.583
+      date: 2020-07-15_09-58-13
+      done: false
+      experiment_id: aa408334e5c240239e967fb42d89ef94
+      experiment_tag: 8_batch_size=4,l1=128,l2=256,lr=0.00042187
+      hostname: fv-az18
+      iterations_since_restore: 5
+      loss: 1.1998296825289727
+      node_ip: 10.1.0.4
+      pid: 9786
+      should_checkpoint: true
+      time_since_restore: 240.25665712356567
+      time_this_iter_s: 48.53873062133789
+      time_total_s: 240.25665712356567
+      timestamp: 1594807093
+      timesteps_since_restore: 0
+      training_iteration: 5
+      trial_id: d01f4_00008
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=8
+    Bracket: Iter 8.000: -1.4494488952221563 | Iter 4.000: -1.3568883704394104 | Iter 2.000: -1.5742607457160949 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (1 PENDING, 1 RUNNING, 8 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |               |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | TERMINATED |               |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | RUNNING    | 10.1.0.4:9786 |            4 |  128 |  256 | 0.000421871 | 1.19983 |     0.583  |                    5 |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=9786)[0m [6,  2000] loss: 1.074
+    [2m[36m(pid=9786)[0m [6,  4000] loss: 0.539
+    [2m[36m(pid=9786)[0m [6,  6000] loss: 0.366
+    [2m[36m(pid=9786)[0m [6,  8000] loss: 0.268
+    [2m[36m(pid=9786)[0m [6, 10000] loss: 0.216
+    Result for DEFAULT_d01f4_00008:
+      accuracy: 0.6064
+      date: 2020-07-15_09-59-01
+      done: false
+      experiment_id: aa408334e5c240239e967fb42d89ef94
+      experiment_tag: 8_batch_size=4,l1=128,l2=256,lr=0.00042187
+      hostname: fv-az18
+      iterations_since_restore: 6
+      loss: 1.1136475174993277
+      node_ip: 10.1.0.4
+      pid: 9786
+      should_checkpoint: true
+      time_since_restore: 287.89716696739197
+      time_this_iter_s: 47.640509843826294
+      time_total_s: 287.89716696739197
+      timestamp: 1594807141
+      timesteps_since_restore: 0
+      training_iteration: 6
+      trial_id: d01f4_00008
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=8
+    Bracket: Iter 8.000: -1.4494488952221563 | Iter 4.000: -1.3568883704394104 | Iter 2.000: -1.5742607457160949 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (1 PENDING, 1 RUNNING, 8 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |               |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | TERMINATED |               |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | RUNNING    | 10.1.0.4:9786 |            4 |  128 |  256 | 0.000421871 | 1.11365 |     0.6064 |                    6 |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=9786)[0m [7,  2000] loss: 1.013
+    [2m[36m(pid=9786)[0m [7,  4000] loss: 0.502
+    [2m[36m(pid=9786)[0m [7,  6000] loss: 0.341
+    [2m[36m(pid=9786)[0m [7,  8000] loss: 0.255
+    [2m[36m(pid=9786)[0m [7, 10000] loss: 0.207
+    Result for DEFAULT_d01f4_00008:
+      accuracy: 0.6068
+      date: 2020-07-15_09-59-48
+      done: false
+      experiment_id: aa408334e5c240239e967fb42d89ef94
+      experiment_tag: 8_batch_size=4,l1=128,l2=256,lr=0.00042187
+      hostname: fv-az18
+      iterations_since_restore: 7
+      loss: 1.1256275371491908
+      node_ip: 10.1.0.4
+      pid: 9786
+      should_checkpoint: true
+      time_since_restore: 335.4203402996063
+      time_this_iter_s: 47.523173332214355
+      time_total_s: 335.4203402996063
+      timestamp: 1594807188
+      timesteps_since_restore: 0
+      training_iteration: 7
+      trial_id: d01f4_00008
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=8
+    Bracket: Iter 8.000: -1.4494488952221563 | Iter 4.000: -1.3568883704394104 | Iter 2.000: -1.5742607457160949 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (1 PENDING, 1 RUNNING, 8 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |               |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | TERMINATED |               |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | RUNNING    | 10.1.0.4:9786 |            4 |  128 |  256 | 0.000421871 | 1.12563 |     0.6068 |                    7 |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=9786)[0m [8,  2000] loss: 0.950
+    [2m[36m(pid=9786)[0m [8,  4000] loss: 0.473
+    [2m[36m(pid=9786)[0m [8,  6000] loss: 0.319
+    [2m[36m(pid=9786)[0m [8,  8000] loss: 0.249
+    [2m[36m(pid=9786)[0m [8, 10000] loss: 0.194
+    Result for DEFAULT_d01f4_00008:
+      accuracy: 0.6242
+      date: 2020-07-15_10-00-38
+      done: false
+      experiment_id: aa408334e5c240239e967fb42d89ef94
+      experiment_tag: 8_batch_size=4,l1=128,l2=256,lr=0.00042187
+      hostname: fv-az18
+      iterations_since_restore: 8
+      loss: 1.1005431885227561
+      node_ip: 10.1.0.4
+      pid: 9786
+      should_checkpoint: true
+      time_since_restore: 385.6419835090637
+      time_this_iter_s: 50.2216432094574
+      time_total_s: 385.6419835090637
+      timestamp: 1594807238
+      timesteps_since_restore: 0
+      training_iteration: 8
+      trial_id: d01f4_00008
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=8
+    Bracket: Iter 8.000: -1.3294912511021937 | Iter 4.000: -1.3568883704394104 | Iter 2.000: -1.5742607457160949 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (1 PENDING, 1 RUNNING, 8 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |               |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | TERMINATED |               |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | RUNNING    | 10.1.0.4:9786 |            4 |  128 |  256 | 0.000421871 | 1.10054 |     0.6242 |                    8 |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=9786)[0m [9,  2000] loss: 0.892
+    [2m[36m(pid=9786)[0m [9,  4000] loss: 0.456
+    [2m[36m(pid=9786)[0m [9,  6000] loss: 0.307
+    [2m[36m(pid=9786)[0m [9,  8000] loss: 0.233
+    [2m[36m(pid=9786)[0m [9, 10000] loss: 0.183
+    Result for DEFAULT_d01f4_00008:
+      accuracy: 0.6256
+      date: 2020-07-15_10-01-26
+      done: false
+      experiment_id: aa408334e5c240239e967fb42d89ef94
+      experiment_tag: 8_batch_size=4,l1=128,l2=256,lr=0.00042187
+      hostname: fv-az18
+      iterations_since_restore: 9
+      loss: 1.093038110397756
+      node_ip: 10.1.0.4
+      pid: 9786
+      should_checkpoint: true
+      time_since_restore: 433.55689549446106
+      time_this_iter_s: 47.91491198539734
+      time_total_s: 433.55689549446106
+      timestamp: 1594807286
+      timesteps_since_restore: 0
+      training_iteration: 9
+      trial_id: d01f4_00008
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=8
+    Bracket: Iter 8.000: -1.3294912511021937 | Iter 4.000: -1.3568883704394104 | Iter 2.000: -1.5742607457160949 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (1 PENDING, 1 RUNNING, 8 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |               |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | TERMINATED |               |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | RUNNING    | 10.1.0.4:9786 |            4 |  128 |  256 | 0.000421871 | 1.09304 |     0.6256 |                    9 |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=9786)[0m [10,  2000] loss: 0.836
+    [2m[36m(pid=9786)[0m [10,  4000] loss: 0.427
+    [2m[36m(pid=9786)[0m [10,  6000] loss: 0.292
+    [2m[36m(pid=9786)[0m [10,  8000] loss: 0.220
+    [2m[36m(pid=9786)[0m [10, 10000] loss: 0.177
+    Result for DEFAULT_d01f4_00008:
+      accuracy: 0.6224
+      date: 2020-07-15_10-02-16
+      done: true
+      experiment_id: aa408334e5c240239e967fb42d89ef94
+      experiment_tag: 8_batch_size=4,l1=128,l2=256,lr=0.00042187
+      hostname: fv-az18
+      iterations_since_restore: 10
+      loss: 1.0935561853351072
+      node_ip: 10.1.0.4
+      pid: 9786
+      should_checkpoint: true
+      time_since_restore: 483.1461057662964
+      time_this_iter_s: 49.58921027183533
+      time_total_s: 483.1461057662964
+      timestamp: 1594807336
+      timesteps_since_restore: 0
+      training_iteration: 10
+      trial_id: d01f4_00008
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=9
+    Bracket: Iter 8.000: -1.3294912511021937 | Iter 4.000: -1.3568883704394104 | Iter 2.000: -1.5742607457160949 | Iter 1.000: -2.30502581577301
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (1 PENDING, 1 RUNNING, 8 TERMINATED)
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc           |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |               |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |               |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |               |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |               |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |               |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |               |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |               |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | TERMINATED |               |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | RUNNING    | 10.1.0.4:9786 |            4 |  128 |  256 | 0.000421871 | 1.09356 |     0.6224 |                   10 |
+    | DEFAULT_d01f4_00009 | PENDING    |               |            4 |   16 |   32 | 0.00538551  |         |            |                      |
+    +---------------------+------------+---------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=10738)[0m Files already downloaded and verified
+    [2m[36m(pid=10738)[0m Files already downloaded and verified
+    [2m[36m(pid=10738)[0m [1,  2000] loss: 2.064
+    [2m[36m(pid=10738)[0m [1,  4000] loss: 0.943
+    [2m[36m(pid=10738)[0m [1,  6000] loss: 0.615
+    [2m[36m(pid=10738)[0m [1,  8000] loss: 0.454
+    [2m[36m(pid=10738)[0m [1, 10000] loss: 0.358
+    Result for DEFAULT_d01f4_00009:
+      accuracy: 0.3484
+      date: 2020-07-15_10-03-08
+      done: false
+      experiment_id: cd703769a4374a1ab3b4d005191a12a3
+      experiment_tag: 9_batch_size=4,l1=16,l2=32,lr=0.0053855
+      hostname: fv-az18
+      iterations_since_restore: 1
+      loss: 1.735014865756035
+      node_ip: 10.1.0.4
+      pid: 10738
+      should_checkpoint: true
+      time_since_restore: 50.695730209350586
+      time_this_iter_s: 50.695730209350586
+      time_total_s: 50.695730209350586
+      timestamp: 1594807388
+      timesteps_since_restore: 0
+      training_iteration: 1
+      trial_id: d01f4_00009
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=9
+    Bracket: Iter 8.000: -1.3294912511021937 | Iter 4.000: -1.3568883704394104 | Iter 2.000: -1.5742607457160949 | Iter 1.000: -2.3021499212265013
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (1 RUNNING, 9 TERMINATED)
+    +---------------------+------------+----------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc            |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+----------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |                |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |                |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |                |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |                |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |                |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |                |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |                |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | TERMINATED |                |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | TERMINATED |                |            4 |  128 |  256 | 0.000421871 | 1.09356 |     0.6224 |                   10 |
+    | DEFAULT_d01f4_00009 | RUNNING    | 10.1.0.4:10738 |            4 |   16 |   32 | 0.00538551  | 1.73501 |     0.3484 |                    1 |
+    +---------------------+------------+----------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    [2m[36m(pid=10738)[0m [2,  2000] loss: 1.771
+    [2m[36m(pid=10738)[0m [2,  4000] loss: 0.876
+    [2m[36m(pid=10738)[0m [2,  6000] loss: 0.590
+    [2m[36m(pid=10738)[0m [2,  8000] loss: 0.437
+    [2m[36m(pid=10738)[0m [2, 10000] loss: 0.354
+    Result for DEFAULT_d01f4_00009:
+      accuracy: 0.3874
+      date: 2020-07-15_10-03-56
+      done: true
+      experiment_id: cd703769a4374a1ab3b4d005191a12a3
+      experiment_tag: 9_batch_size=4,l1=16,l2=32,lr=0.0053855
+      hostname: fv-az18
+      iterations_since_restore: 2
+      loss: 1.7258268669843673
+      node_ip: 10.1.0.4
+      pid: 10738
+      should_checkpoint: true
+      time_since_restore: 99.37270617485046
+      time_this_iter_s: 48.67697596549988
+      time_total_s: 99.37270617485046
+      timestamp: 1594807436
+      timesteps_since_restore: 0
+      training_iteration: 2
+      trial_id: d01f4_00009
+  
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=10
+    Bracket: Iter 8.000: -1.3294912511021937 | Iter 4.000: -1.3568883704394104 | Iter 2.000: -1.6500438063502312 | Iter 1.000: -2.3021499212265013
+    Resources requested: 2/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (1 RUNNING, 9 TERMINATED)
+    +---------------------+------------+----------------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc            |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+----------------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |                |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |                |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |                |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |                |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |                |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |                |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |                |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | TERMINATED |                |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | TERMINATED |                |            4 |  128 |  256 | 0.000421871 | 1.09356 |     0.6224 |                   10 |
+    | DEFAULT_d01f4_00009 | RUNNING    | 10.1.0.4:10738 |            4 |   16 |   32 | 0.00538551  | 1.72583 |     0.3874 |                    2 |
+    +---------------------+------------+----------------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    == Status ==
+    Memory usage on this node: 1.7/6.8 GiB
+    Using AsyncHyperBand: num_stopped=10
+    Bracket: Iter 8.000: -1.3294912511021937 | Iter 4.000: -1.3568883704394104 | Iter 2.000: -1.6500438063502312 | Iter 1.000: -2.3021499212265013
+    Resources requested: 0/2 CPUs, 0/0 GPUs, 0.0/3.56 GiB heap, 0.0/1.22 GiB objects
+    Result logdir: /home/runner/ray_results/DEFAULT
+    Number of trials: 10 (10 TERMINATED)
+    +---------------------+------------+-------+--------------+------+------+-------------+---------+------------+----------------------+
+    | Trial name          | status     | loc   |   batch_size |   l1 |   l2 |          lr |    loss |   accuracy |   training_iteration |
+    |---------------------+------------+-------+--------------+------+------+-------------+---------+------------+----------------------|
+    | DEFAULT_d01f4_00000 | TERMINATED |       |            8 |    4 |   64 | 0.0122495   | 2.30651 |     0.0988 |                   10 |
+    | DEFAULT_d01f4_00001 | TERMINATED |       |            4 |  128 |   64 | 0.000244637 | 1.19909 |     0.5759 |                   10 |
+    | DEFAULT_d01f4_00002 | TERMINATED |       |           16 |  256 |    8 | 0.0880943   | 2.30821 |     0.1048 |                    1 |
+    | DEFAULT_d01f4_00003 | TERMINATED |       |            2 |  128 |  256 | 0.0291105   | 2.31502 |     0.0988 |                    1 |
+    | DEFAULT_d01f4_00004 | TERMINATED |       |            8 |   64 |   16 | 0.0602952   | 2.32    |     0.1009 |                    1 |
+    | DEFAULT_d01f4_00005 | TERMINATED |       |            8 |    4 |   64 | 0.000120017 | 2.16629 |     0.2197 |                    2 |
+    | DEFAULT_d01f4_00006 | TERMINATED |       |            2 |  256 |  256 | 0.00145522  | 1.54332 |     0.5255 |                   10 |
+    | DEFAULT_d01f4_00007 | TERMINATED |       |            8 |    4 |   32 | 0.058841    | 2.31408 |     0.1038 |                    1 |
+    | DEFAULT_d01f4_00008 | TERMINATED |       |            4 |  128 |  256 | 0.000421871 | 1.09356 |     0.6224 |                   10 |
+    | DEFAULT_d01f4_00009 | TERMINATED |       |            4 |   16 |   32 | 0.00538551  | 1.72583 |     0.3874 |                    2 |
+    +---------------------+------------+-------+--------------+------+------+-------------+---------+------------+----------------------+
+
+
+    Best trial config: {'l1': 128, 'l2': 256, 'lr': 0.00042187065838239355, 'batch_size': 4}
+    Best trial final validation loss: 1.0935561853351072
+    Best trial final validation accuracy: 0.6224
+    Files already downloaded and verified
+    Files already downloaded and verified
+    Best trial test set accuracy: 0.6191
+
+
+If you run the code, an example output could look like this:
+
+.. code-block::
+
+    Number of trials: 10 (10 TERMINATED)
+    +-----+------+------+-------------+--------------+---------+------------+--------------------+
+    | ... |   l1 |   l2 |          lr |   batch_size |    loss |   accuracy | training_iteration |
+    |-----+------+------+-------------+--------------+---------+------------+--------------------|
+    | ... |   64 |    4 | 0.00011629  |            2 | 1.87273 |     0.244  |                  2 |
+    | ... |   32 |   64 | 0.000339763 |            8 | 1.23603 |     0.567  |                  8 |
+    | ... |    8 |   16 | 0.00276249  |           16 | 1.1815  |     0.5836 |                 10 |
+    | ... |    4 |   64 | 0.000648721 |            4 | 1.31131 |     0.5224 |                  8 |
+    | ... |   32 |   16 | 0.000340753 |            8 | 1.26454 |     0.5444 |                  8 |
+    | ... |    8 |    4 | 0.000699775 |            8 | 1.99594 |     0.1983 |                  2 |
+    | ... |  256 |    8 | 0.0839654   |           16 | 2.3119  |     0.0993 |                  1 |
+    | ... |   16 |  128 | 0.0758154   |           16 | 2.33575 |     0.1327 |                  1 |
+    | ... |   16 |    8 | 0.0763312   |           16 | 2.31129 |     0.1042 |                  4 |
+    | ... |  128 |   16 | 0.000124903 |            4 | 2.26917 |     0.1945 |                  1 |
+    +-----+------+------+-------------+--------------+---------+------------+--------------------+
+
+
+    Best trial config: {'l1': 8, 'l2': 16, 'lr': 0.00276249, 'batch_size': 16, 'data_dir': '...'}
+    Best trial final validation loss: 1.181501
+    Best trial final validation accuracy: 0.5836
+    Best trial test set accuracy: 0.5806
+
+Most trials have been stopped early in order to avoid wasting resources.
+The best performing trial achieved a validation accuracy of about 58%, which could
+be confirmed on the test set.
+
+So that's it! You can now tune the parameters of your PyTorch models.
+
+
+.. rst-class:: sphx-glr-timing
+
+   **Total running time of the script:** ( 40 minutes  58.135 seconds)
+
+
+.. _sphx_glr_download_beginner_hyperparameter_tuning_tutorial.py:
+
+
+.. only :: html
+
+ .. container:: sphx-glr-footer
+    :class: sphx-glr-footer-example
+
+
+
+  .. container:: sphx-glr-download
+
+     :download:`Download Python source code: hyperparameter_tuning_tutorial.py <hyperparameter_tuning_tutorial.py>`
+
+
+
+  .. container:: sphx-glr-download
+
+     :download:`Download Jupyter notebook: hyperparameter_tuning_tutorial.ipynb <hyperparameter_tuning_tutorial.ipynb>`
+
+
+.. only:: html
+
+ .. rst-class:: sphx-glr-signature
+
+    `Gallery generated by Sphinx-Gallery <https://sphinx-gallery.readthedocs.io>`_
